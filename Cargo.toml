@@ -1,0 +1,25 @@
+[package]
+name = "kaamos"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural 80s night-synth machine: every sound generated in code, live calm/intensity control"
+license = "MIT"
+repository = "https://github.com/taituo/kaamos"
+
+[features]
+default = ["audio"]
+# Live audio output through cpal (CoreAudio on macOS, ALSA on Linux).
+# Build with --no-default-features for a dependency-free build (render + --stdout only).
+audio = ["dep:cpal"]
+
+[dependencies]
+cpal = { version = "0.18", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Audio DSP needs optimisation even in debug builds or it will crackle.
+[profile.dev]
+opt-level = 2

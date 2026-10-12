@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#07050a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>KAAMOS</title>
+<style>
+:root{
+  --bg:#07050a; --panel:#110a0f; --line:#2b131b; --red:#ff2d45; --red2:#b3122a; --ember:#ff7a59;
+  --text:#f4dfe1; --mute:#8d7479; --cyan:#59e1ff; --on:#ff2d45;
+  --mono: ui-monospace, "SF Mono", Menlo, "Cascadia Mono", Consolas, monospace;
+  --serif: "Didot", "Bodoni 72", Georgia, "Times New Roman", serif;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--mono)}
+body{
+  min-height:100vh;
+  background:
+    radial-gradient(120% 60% at 50% -12%, rgba(255,45,69,.28), transparent 60%),
+    radial-gradient(80% 50% at 50% 115%, rgba(89,225,255,.07), transparent 70%),
+    var(--bg);
+  background-attachment:fixed;
+}
+body::after{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
+  background:repeating-linear-gradient(0deg, rgba(0,0,0,.28) 0 1px, transparent 1px 3px);
+  mix-blend-mode:multiply;
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:8;
+  box-shadow: inset 0 0 140px rgba(0,0,0,.85);
+}
+main{max-width:560px;margin:0 auto;padding:max(16px, env(safe-area-inset-top)) 16px 40px}
+header{text-align:center;padding:18px 0 8px}
+.logo{
+  margin:0;font-family:var(--serif);font-weight:700;
+  font-size:clamp(46px, 16vw, 92px);letter-spacing:.14em;line-height:1;
+  color:transparent;-webkit-text-stroke:1.6px var(--red);
+  text-shadow:0 0 10px rgba(255,45,69,.65),0 0 28px rgba(255,45,69,.45),0 0 60px rgba(255,45,69,.25);
+  animation:flick 7s infinite;
+  padding-left:.14em;
+}
+@keyframes flick{0%,92%,100%{opacity:1}93%{opacity:.55}94%{opacity:1}96%{opacity:.75}97%{opacity:1}}
+.sub{color:var(--mute);letter-spacing:.42em;font-size:11px;text-transform:uppercase;margin-top:8px}
+.status{
+  margin:14px auto 0;display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center;
+  font-size:13px;color:var(--cyan);padding:7px 12px;border:1px solid rgba(89,225,255,.25);border-radius:999px;
+  background:rgba(89,225,255,.05);text-shadow:0 0 8px rgba(89,225,255,.5)
+}
+.status .sep{color:var(--mute);text-shadow:none}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 10px var(--red);display:inline-block}
+.dot.off{background:#444;box-shadow:none}
+.card{
+  margin-top:16px;padding:16px;border:1px solid var(--line);border-radius:14px;
+  background:linear-gradient(180deg, rgba(255,45,69,.05), rgba(0,0,0,.25)), var(--panel);
+}
+h2{margin:0 0 12px;font-size:11px;letter-spacing:.32em;color:var(--mute);font-weight:600;display:flex;justify-content:space-between;align-items:baseline}
+h2 small{letter-spacing:.08em;font-weight:400;font-size:10px;text-transform:none}
+.row{display:flex;justify-content:space-between;align-items:baseline}
+label{font-size:12px;letter-spacing:.2em;color:var(--text)}
+output{font-size:13px;color:var(--ember);font-variant-numeric:tabular-nums}
+.hero label{font-size:13px;letter-spacing:.3em}
+.hero output{font-size:28px;color:var(--red);text-shadow:0 0 12px rgba(255,45,69,.6)}
+
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:36px;background:transparent;margin:6px 0;touch-action:pan-y}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,#2a0d14,var(--red2) 60%,var(--red))}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:linear-gradient(90deg,#2a0d14,var(--red2) 60%,var(--red))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;border-radius:50%;margin-top:-10px;background:#16090d;border:2px solid var(--red);box-shadow:0 0 14px rgba(255,45,69,.75)}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#16090d;border:2px solid var(--red);box-shadow:0 0 14px rgba(255,45,69,.75)}
+.hero input[type=range]{height:52px}
+.hero input[type=range]::-webkit-slider-runnable-track{height:10px;border-radius:5px}
+.hero input[type=range]::-webkit-slider-thumb{width:38px;height:38px;margin-top:-14px}
+
+.meter{height:4px;border-radius:2px;background:#1c0e13;overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--cyan);box-shadow:0 0 10px var(--cyan);transition:width .5s linear}
+.presets{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:12px}
+button{
+  font-family:var(--mono);color:var(--text);background:#160b10;border:1px solid var(--line);border-radius:10px;
+  min-height:44px;font-size:11px;letter-spacing:.12em;cursor:pointer;transition:transform .06s, background .2s, box-shadow .2s;
+}
+button:active{transform:scale(.96)}
+.presets button.sel{border-color:var(--red);color:var(--red);box-shadow:0 0 12px rgba(255,45,69,.35) inset}
+.pads{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.pad{min-height:64px;font-size:14px;letter-spacing:.25em;font-weight:700}
+.pad.big{grid-column:span 2;min-height:84px;font-size:22px;letter-spacing:.5em;color:var(--red);border-color:var(--red2);
+  text-shadow:0 0 12px rgba(255,45,69,.7);background:radial-gradient(circle at 50% 50%, rgba(255,45,69,.16), #160b10 70%)}
+.pad.hit{background:var(--red);color:#000;box-shadow:0 0 40px var(--red)}
+.toggles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.tog.on{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 14px rgba(89,225,255,.35) inset;text-shadow:0 0 8px rgba(89,225,255,.6)}
+.layers{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.layer{display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:10px 10px 9px;text-align:left;min-height:66px}
+.ln{font-size:13px;letter-spacing:.14em;text-transform:uppercase}
+.lm{font-size:10px;color:var(--mute);letter-spacing:.2em}
+.lb{height:4px;background:#1c0e13;border-radius:2px;overflow:hidden}
+.lb i{display:block;height:100%;width:0;background:var(--red);transition:width .4s linear}
+.layer.m-on{border-color:var(--red)} .layer.m-on .lm{color:var(--red)}
+.layer.m-off{opacity:.45} .layer.m-off .lm{color:var(--mute)}
+.ctl{margin-bottom:4px}
+footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;margin-top:22px;text-transform:uppercase}
+.offline .status{color:var(--mute);border-color:var(--line)}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 class="logo">KAAMOS</h1>
+    <div class="sub">procedural night synth</div>
+    <div class="status"><i class="dot" id="dot"></i><span id="key">—</span><span class="sep">·</span><span id="chord">—</span><span class="sep">·</span><span>bar <span id="bar">0</span></span><span class="sep">·</span><span><span id="bpmv">92</span> bpm</span></div>
+  </header>
+
+  <section class="card hero">
+    <div class="row"><label for="intensity">INTENSITY</label><output for="intensity" data-fmt="2">0.30</output></div>
+    <input type="range" id="intensity" min="0" max="1" step="0.01" value="0.3">
+    <div class="meter" title="where the music actually is"><i id="inow"></i></div>
+    <div class="presets" id="presets">
+      <button data-i="0">DORMANT</button><button data-i="0.25">EERIE</button><button data-i="0.5">PULSE</button><button data-i="0.75">DRIVE</button><button data-i="1">PEAK</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>MOMENTS</h2>
+    <div class="pads">
+      <button class="pad big" data-cmd="boom">BOOM</button>
+      <button class="pad" data-cmd="riser">RISE</button>
+      <button class="pad" data-cmd="fill">FILL</button>
+      <button class="pad" data-cmd="next">NEXT</button>
+      <button class="pad" data-cmd="key">NEW KEY</button>
+    </div>
+    <div class="toggles">
+      <button class="tog" data-tog="drift">DRIFT</button>
+      <button class="tog" data-tog="hold">HOLD</button>
+      <button class="tog" data-tog="fade">FADE OUT</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>LAYERS <small>tap · auto → on → off</small></h2>
+    <div class="layers" id="layers"></div>
+  </section>
+
+  <section class="card">
+    <h2>SOUND</h2>
+    <div class="ctl"><div class="row"><label for="darkness">DARKNESS</label><output for="darkness" data-fmt="2"></output></div>
+      <input type="range" id="darkness" min="0" max="1" step="0.01"></div>
+    <div class="ctl"><div class="row"><label for="bpm">TEMPO</label><output for="bpm" data-fmt="0"></output></div>
+      <input type="range" id="bpm" min="60" max="140" step="1"></div>
+    <div class="ctl"><div class="row"><label for="space">SPACE</label><output for="space" data-fmt="2"></output></div>
+      <input type="range" id="space" min="0" max="1" step="0.01"></div>
+    <div class="ctl"><div class="row"><label for="tape">TAPE / VHS</label><output for="tape" data-fmt="2"></output></div>
+      <input type="range" id="tape" min="0" max="1" step="0.01"></div>
+    <div class="ctl"><div class="row"><label for="volume">VOLUME</label><output for="volume" data-fmt="2"></output></div>
+      <input type="range" id="volume" min="0" max="1" step="0.01"></div>
+  </section>
+
+  <section class="card">
+    <h2>DRIFT RANGE <small>where auto-drift wanders</small></h2>
+    <div class="ctl"><div class="row"><label for="drift_min">LOW</label><output for="drift_min" data-fmt="2"></output></div>
+      <input type="range" id="drift_min" min="0" max="1" step="0.01"></div>
+    <div class="ctl"><div class="row"><label for="drift_max">HIGH</label><output for="drift_max" data-fmt="2"></output></div>
+      <input type="range" id="drift_max" min="0" max="1" step="0.01"></div>
+  </section>
+
+  <footer>every sound synthesized live · no samples</footer>
+</main>
+<script>
+const LAYERS = ["drone","pad","arp","bass","drums","lead","bells"];
+const $ = (s) => document.querySelector(s);
+const busy = {};
+const pending = {};
+const timers = {};
+
+const layersEl = $("#layers");
+for (const n of LAYERS) {
+  const b = document.createElement("button");
+  b.className = "layer";
+  b.dataset.l = n;
+  b.innerHTML = `<span class="ln">${n}</span><span class="lm">auto</span><span class="lb"><i></i></span>`;
+  b.addEventListener("click", () => { buzz(); cmd(n + "=cycle"); });
+  layersEl.appendChild(b);
+}
+
+function buzz(){ try { navigator.vibrate && navigator.vibrate(12); } catch(e){} }
+
+function online(ok){
+  document.body.classList.toggle("offline", !ok);
+  $("#dot").classList.toggle("off", !ok);
+}
+
+async function cmd(c){
+  try {
+    const r = await fetch("/api/cmd?c=" + encodeURIComponent(c), {cache:"no-store"});
+    render(await r.json()); online(true);
+  } catch(e){ online(false); }
+}
+
+function send(name, val){
+  pending[name] = val;
+  if (timers[name]) return;
+  timers[name] = setTimeout(() => { timers[name] = null; cmd(name + "=" + pending[name]); }, 60);
+}
+
+function showOut(el){
+  const o = document.querySelector(`output[for="${el.id}"]`);
+  if (o) o.textContent = Number(el.value).toFixed(Number(o.dataset.fmt || 2));
+}
+
+document.querySelectorAll('input[type=range]').forEach((el) => {
+  const mark = () => { busy[el.id] = Date.now(); };
+  el.addEventListener("pointerdown", mark);
+  el.addEventListener("touchstart", mark, {passive:true});
+  el.addEventListener("input", () => { mark(); showOut(el); send(el.id, el.value); });
+});
+
+document.querySelectorAll("#presets button").forEach((b) => {
+  b.addEventListener("click", () => { buzz(); busy.intensity = 0; cmd("intensity=" + b.dataset.i); });
+});
+
+document.querySelectorAll("[data-cmd]").forEach((b) => {
+  b.addEventListener("click", () => {
+    buzz(); cmd(b.dataset.cmd);
+    b.classList.add("hit"); setTimeout(() => b.classList.remove("hit"), 180);
+  });
+});
+
+document.querySelectorAll("[data-tog]").forEach((b) => {
+  b.addEventListener("click", () => { buzz(); cmd(b.dataset.tog); });
+});
+
+function render(s){
+  for (const id of ["intensity","darkness","bpm","space","tape","volume","drift_min","drift_max"]) {
+    const el = document.getElementById(id);
+    if (!el || s[id] === undefined) continue;
+    if (Date.now() - (busy[id] || 0) > 1500) { el.value = s[id]; }
+    showOut(el);
+  }
+  $("#inow").style.width = (s.intensity_now * 100).toFixed(1) + "%";
+  $("#key").textContent = s.key;
+  $("#chord").textContent = s.chord || "—";
+  $("#bar").textContent = s.bar;
+  $("#bpmv").textContent = Math.round(s.bpm);
+  document.querySelectorAll("#presets button").forEach((b) => {
+    b.classList.toggle("sel", Math.abs(Number(b.dataset.i) - s.intensity) < 0.02);
+  });
+  document.querySelectorAll("[data-tog]").forEach((b) => b.classList.toggle("on", !!s[b.dataset.tog]));
+  for (const n of LAYERS) {
+    const L = s.layers[n]; if (!L) continue;
+    const b = layersEl.querySelector(`[data-l="${n}"]`);
+    b.querySelector(".lm").textContent = L.mode;
+    b.querySelector(".lb i").style.width = (L.level * 100).toFixed(0) + "%";
+    b.classList.toggle("m-on", L.mode === "on");
+    b.classList.toggle("m-off", L.mode === "off");
+  }
+}
+
+async function poll(){
+  try {
+    const r = await fetch("/api/state", {cache:"no-store"});
+    render(await r.json()); online(true);
+  } catch(e){ online(false); }
+  setTimeout(poll, 600);
+}
+poll();
+</script>
+</body>
+</html>
