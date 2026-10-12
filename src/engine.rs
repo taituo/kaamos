@@ -19,6 +19,7 @@ const ARP_GAIN: f32 = 0.52;
 const BASS_GAIN: f32 = 0.42;
 const LEAD_GAIN: f32 = 0.8;
 const BELL_GAIN: f32 = 0.24;
+const KEYS_GAIN: f32 = 0.2;
 const DRUM_GAIN: f32 = 0.62;
 const MASTER_GAIN: f32 = 1.35;
 
@@ -34,7 +35,7 @@ pub struct Engine {
     space: f32,
     tape_amt: f32,
     vol: f32,
-    gains: [f32; 7],
+    gains: [f32; NL],
     fader: f32,
     fill_gain: f32,
 
@@ -55,6 +56,12 @@ pub struct Engine {
     loop_bars: u32,
     sec_bars: u32,
     motif: Vec<usize>,
+    keys_pat: usize,
+    // live lead from the phone pads
+    play_seen: u32,
+    live_timer: f32,
+    auto_lead_g: f32,
+    lead_hist: [i32; 2],
     arp_count: u32,
     arp_rate: u32,
     bass_pats: [usize; 3],
@@ -114,7 +121,9 @@ pub struct Engine {
     bass: Bass,
     drone: Drone,
     lead: Lead,
+    solo: Lead,
     bells: Bells,
+    keys: Keys,
     drums: Drums,
     imp: Impacts,
 
@@ -147,6 +156,7 @@ fn auto_gain(layer: usize, i: f32) -> f32 {
         L_BASS => smoothstep(0.3, 0.45, i),
         L_DRUMS => smoothstep(0.36, 0.44, i),
         L_LEAD => smoothstep(0.72, 0.84, i),
+        L_KEYS => smoothstep(0.18, 0.32, i) * (1.0 - 0.6 * smoothstep(0.78, 1.0, i)),
         _ => (0.55 + 0.45 * smoothstep(0.0, 0.2, i)) * (1.0 - 0.75 * smoothstep(0.55, 0.85, i)),
     }
 }
@@ -167,7 +177,7 @@ impl Engine {
             space: sh.space.get(),
             tape_amt: sh.tape.get(),
             vol: sh.volume.get(),
-            gains: [0.0; 7],
+            gains: [0.0; NL],
             fader: 0.0,
             fill_gain: 0.0,
             step_phase: 1.0,
@@ -184,6 +194,11 @@ impl Engine {
             loop_bars: 4,
             sec_bars: 16,
             motif: vec![0, 1, 2, 3],
+            keys_pat: 0,
+            play_seen: sh.play_seq.load(Relaxed),
+            live_timer: 1e9,
+            auto_lead_g: 1.0,
+            lead_hist: [-1, -1],
             arp_count: 0,
             arp_rate: 2,
             bass_pats: [0; 3],
@@ -237,7 +252,9 @@ impl Engine {
             bass: Bass::new(sr),
             drone: Drone::new(sr, (key - 12) as f32),
             lead: Lead::new(sr),
+            solo: Lead::new(sr),
             bells: Bells::new(sr),
+            keys: Keys::new(sr),
             drums: Drums::new(sr),
             imp: Impacts::new(sr),
             chorus: Chorus::new(sr),
@@ -251,7 +268,7 @@ impl Engine {
         };
         e.gverb.set_t60(2.6);
         // start layers at their auto level so the first sound is already "in place"
-        for l in 0..7 {
+        for l in 0..NL {
             e.gains[l] = e.layer_target(l);
         }
         e
@@ -313,7 +330,7 @@ impl Engine {
         }
 
         // layer gains
-        for l in 0..7 {
+        for l in 0..NL {
             let target = self.layer_target(l);
             self.gains[l] += (target - self.gains[l]) * coef(1.3, rate);
         }
@@ -367,7 +384,7 @@ impl Engine {
 
         // status
         sh.st_intensity.set(self.inten);
-        for l in 0..7 {
+        for l in 0..NL {
             sh.st_levels[l].set(self.gains[l]);
         }
         sh.st_peak.set(self.peak);
@@ -383,6 +400,58 @@ impl Engine {
         sh.st_bars_left.store(left, Relaxed);
         sh.st_loops.store(self.extra_loops, Relaxed);
         sh.st_loop_bars.store(self.loop_bars, Relaxed);
+
+        // live lead from the phone: play / release, and let the auto melody step aside
+        let ps = sh.play_seq.load(Relaxed);
+        if ps != self.play_seen {
+            self.play_seen = ps;
+            let n = sh.play_note.load(Relaxed);
+            if n >= 0 {
+                self.solo.note_on(n, 0.9, u32::MAX);
+                self.push_lead(n);
+                self.live_timer = 0.0;
+            } else {
+                self.solo.release();
+            }
+        }
+        if self.solo.held().is_some() {
+            self.live_timer = 0.0;
+        } else {
+            self.live_timer += dt;
+        }
+        let lead_target = if self.live_timer < 6.0 { 0.0 } else { 1.0 };
+        let tau = if lead_target < self.auto_lead_g { 0.12 } else { 2.5 };
+        self.auto_lead_g += (lead_target - self.auto_lead_g) * coef(tau, rate);
+
+        // what is sounding, for the keyboard displays
+        let lead_now = self.solo.held().or_else(|| {
+            if self.gains[L_LEAD] * self.auto_lead_g > 0.05 {
+                self.lead.held()
+            } else {
+                None
+            }
+        });
+        sh.st_lead_note.store(lead_now.unwrap_or(-1), Relaxed);
+        if self.gains[L_BASS] < 0.05 {
+            sh.st_bass_note.store(-1, Relaxed);
+        }
+        if self.gains[L_ARP] < 0.05 {
+            sh.st_arp_note.store(-1, Relaxed);
+        }
+        if self.gains[L_KEYS] < 0.05 {
+            mask_set(&sh.st_keys_mask, &[]);
+        }
+        let machine = if self.lead_line.is_empty() {
+            -1
+        } else {
+            let pos = (self.bar_in_sec % self.loop_bars.max(1)) * 16 + (self.step % 16) as u32;
+            self.lead_line
+                .iter()
+                .find(|n| n.start >= pos)
+                .unwrap_or(&self.lead_line[0])
+                .midi
+        };
+        sh.st_machine_next.store(machine, Relaxed);
         self.peak *= 0.97;
     }
 
@@ -480,6 +549,7 @@ impl Engine {
             self.rng.below(BASS_HIGH.len()),
         ];
         self.drum_var = self.rng.below(3) as u8;
+        self.keys_pat = pick_keys_pattern(&mut self.rng, i);
         self.lead_line = gen_lead(&mut self.rng, self.key, self.mode, &self.prog, self.bpc);
         self.arp_count = 0;
         self.chord_idx = usize::MAX;
@@ -508,6 +578,8 @@ impl Engine {
         }
         self.arp_notes = arp_tones(self.key, self.mode, self.chord_deg, 4, 57);
         self.bass_root = self.bass_root_for(self.chord_deg);
+        mask_set(&self.sh.st_chord_mask, &notes);
+        self.sh.st_chord_deg.store(self.chord_deg, Relaxed);
         if let Ok(mut s) = self.sh.st_chord.try_lock() {
             *s = chord_name(self.key, self.mode, self.chord_deg, ext);
         }
@@ -588,8 +660,29 @@ impl Engine {
                     .collect()
             })
             .collect();
+        let kp = KEYS_PATTERNS[self.keys_pat % KEYS_PATTERNS.len()].1;
+        let mut keys = Vec::new();
+        for b in 0..bars {
+            let d = chord_at(b);
+            let (low, upper) = self.keys_voicing(d);
+            let tones = self.keys_broken(d, low, &upper);
+            for &(st, hit, len, _) in kp {
+                let notes = match hit {
+                    Hit::Chord => {
+                        let mut v = upper.clone();
+                        if st == 0 {
+                            v.insert(0, low);
+                        }
+                        v
+                    }
+                    Hit::Tone(k) => vec![tones[k as usize % tones.len()]],
+                };
+                keys.push((b * 16 + st as u32, len.round().max(1.0) as u32, notes));
+            }
+        }
         let ext = chord_ext(i);
         crate::strudel::Snapshot {
+            keys,
             seed: self.seed,
             section: self.section,
             key_name: format!(
@@ -757,6 +850,7 @@ impl Engine {
             let gate = (sps * self.arp_rate as f32 * 0.6) as u32;
             let p = if self.arp_count % 2 == 0 { -0.22 } else { 0.22 };
             self.arp.note_on(note, accent, gate, p, decay);
+            self.sh.st_arp_note.store(note, Relaxed);
             self.arp_count += 1;
         }
 
@@ -766,8 +860,9 @@ impl Engine {
             let pat = pats[self.bass_level][self.bass_pats[self.bass_level] % pats[self.bass_level].len()];
             for &(st, off, len, acc) in pat {
                 if st as u32 == sib {
-                    self.bass
-                        .note_on(self.bass_root + off as i32, 0.6 + 0.4 * acc, (len * sps) as u32);
+                    let n = self.bass_root + off as i32;
+                    self.bass.note_on(n, 0.6 + 0.4 * acc, (len * sps) as u32);
+                    self.sh.st_bass_note.store(n, Relaxed);
                 }
             }
         }
@@ -782,6 +877,9 @@ impl Engine {
                 let n = self.lead_line[k];
                 if n.start == pos {
                     self.lead.note_on(n.midi, 0.85, (n.dur as f32 * sps * 0.93) as u32);
+                    if self.auto_lead_g > 0.5 {
+                        self.push_lead(n.midi);
+                    }
                 }
             }
         }
@@ -805,7 +903,71 @@ impl Engine {
             }
         }
 
+        // ---- keys (electric piano comping)
+        if self.gains[L_KEYS] > 0.002 {
+            let pat = KEYS_PATTERNS[self.keys_pat % KEYS_PATTERNS.len()].1;
+            for &(st, hit, len, vel) in pat {
+                if st as u32 != sib {
+                    continue;
+                }
+                let (low, upper) = self.keys_voicing(self.chord_deg);
+                let gate = (len * sps) as u32;
+                let mut played = Vec::with_capacity(6);
+                match hit {
+                    Hit::Chord => {
+                        for &n in &upper {
+                            self.keys.note_on(n, vel, gate);
+                            played.push(n);
+                        }
+                        if sib == 0 {
+                            self.keys.note_on(low, vel * 0.8, gate);
+                            played.push(low);
+                        }
+                    }
+                    Hit::Tone(k) => {
+                        let tones = self.keys_broken(self.chord_deg, low, &upper);
+                        let n = tones[k as usize % tones.len()];
+                        self.keys.note_on(n, vel, gate);
+                        played.push(n);
+                    }
+                }
+                mask_set(&self.sh.st_keys_mask, &played);
+            }
+        }
+
         self.step += 1;
+    }
+
+    fn push_lead(&mut self, n: i32) {
+        self.lead_hist = [n, self.lead_hist[0]];
+        self.sh.st_lead_prev.store(self.lead_hist[0], Relaxed);
+        self.sh.st_lead_prev2.store(self.lead_hist[1], Relaxed);
+    }
+
+    /// Keys voicing: a low root under a close upper voicing.
+    fn keys_voicing(&self, d: i32) -> (i32, Vec<i32>) {
+        let ext = if self.inten < 0.5 { 5 } else { 4 };
+        let upper = voicing(self.key + 12, self.mode, d, ext, 67.0);
+        let mut low = deg(self.key, self.mode, d);
+        while low >= upper[0] - 5 {
+            low -= 12;
+        }
+        while low < 40 {
+            low += 12;
+        }
+        (low, upper)
+    }
+
+    /// Broken-chord tone list: root, fifth, then the upper voicing (no doubled notes).
+    fn keys_broken(&self, d: i32, low: i32, upper: &[i32]) -> Vec<i32> {
+        let fifth = deg(0, self.mode, d + 4) - deg(0, self.mode, d);
+        let mut t = vec![low, low + fifth];
+        for &n in upper {
+            if !t.contains(&n) {
+                t.push(n);
+            }
+        }
+        t
     }
 
     fn drum_step(&mut self, s: u32) {
@@ -947,7 +1109,11 @@ impl Engine {
             * g[L_BASS]
             * (1.0 - 0.5 * self.c_duck_depth * self.duck)
             * BASS_GAIN;
-        let lead = self.lead.process(self.c_lead_cut, 0.8) * g[L_LEAD] * LEAD_GAIN;
+        let solo = self.solo.process(self.c_lead_cut.max(1500.0), 0.8) * LEAD_GAIN;
+        let lead = self.lead.process(self.c_lead_cut, 0.8) * g[L_LEAD] * self.auto_lead_g * LEAD_GAIN + solo;
+        let (epl, epr) = self.keys.process();
+        let kg = g[L_KEYS] * KEYS_GAIN * (0.6 + 0.4 * pump);
+        let (epl, epr) = (epl * kg, epr * kg);
         let (bl, br) = self.bells.process();
         let (bl, br) = (bl * g[L_BELLS] * BELL_GAIN, br * g[L_BELLS] * BELL_GAIN);
         let dg = g[L_DRUMS].max(self.fill_gain) * DRUM_GAIN;
@@ -959,18 +1125,34 @@ impl Engine {
         let (cl, cr) = self.chorus.process(pad, 1.0);
         let (ll, lr) = pan(lead, -0.12);
 
-        let dry_l = cl + dr * 0.7 + airl + al + bass * 0.7 + ll + bl + kl + il;
-        let dry_r = cr + dr * 0.7 + airr + ar + bass * 0.7 + lr + br + kr + ir;
+        let dry_l = cl + dr * 0.7 + airl + al + bass * 0.7 + ll + bl + kl + il + epl;
+        let dry_r = cr + dr * 0.7 + airr + ar + bass * 0.7 + lr + br + kr + ir + epr;
 
         // tape echo
-        let echo_in = (al + ar) * 0.32 + lead * 0.42 + (bl + br) * 0.3;
+        let echo_in = (al + ar) * 0.32 + lead * 0.42 + (bl + br) * 0.3 + (epl + epr) * 0.08;
         let (el, er) = self.echo.process(echo_in, self.c_echo_t, self.c_echo_fb);
 
         // hall
-        let rin_l =
-            cl * 0.5 + al * 0.35 + ll * 0.45 + bl * 0.8 + el * 0.45 + airl * 0.6 + isend + dr * 0.08 + kl * 0.05;
-        let rin_r =
-            cr * 0.5 + ar * 0.35 + lr * 0.45 + br * 0.8 + er * 0.45 + airr * 0.6 + isend + dr * 0.08 + kr * 0.05;
+        let rin_l = cl * 0.5
+            + al * 0.35
+            + ll * 0.45
+            + bl * 0.8
+            + el * 0.45
+            + airl * 0.6
+            + isend
+            + dr * 0.08
+            + kl * 0.05
+            + epl * 0.4;
+        let rin_r = cr * 0.5
+            + ar * 0.35
+            + lr * 0.45
+            + br * 0.8
+            + er * 0.45
+            + airr * 0.6
+            + isend
+            + dr * 0.08
+            + kr * 0.05
+            + epr * 0.4;
         let (rl, rr) = self.verb.process(rin_l, rin_r);
         let (rl, rr) = (rl * self.c_wet, rr * self.c_wet);
 

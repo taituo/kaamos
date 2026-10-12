@@ -104,6 +104,32 @@ button:active{transform:scale(.96)}
 .layer.m-on{border-color:var(--red)} .layer.m-on .lm{color:var(--red)}
 .layer.m-off{opacity:.45} .layer.m-off .lm{color:var(--mute)}
 .ctl{margin-bottom:4px}
+/* keyboard display */
+.kb{position:relative;height:74px;display:flex;border-radius:6px;overflow:hidden;background:#000;margin-top:2px}
+.kb .w{flex:1;margin-right:1px;background:#e9e2e3;border-radius:0 0 3px 3px;transition:background .08s}
+.kb .w.out{background:#8d8587}
+.kb .b{position:absolute;top:0;height:46px;background:#2a2326;border-radius:0 0 2px 2px;z-index:2;transition:background .08s}
+.kb .b.out{background:#141012}
+.kb .chord{background:#ff5f6d!important}
+.kb .keys{background:#b48cff!important}
+.kb .arp{background:#ff9a5c!important}
+.kb .bass{background:#38d6e6!important}
+.kb .lead{background:#ffe27a!important;box-shadow:0 0 10px #ffe27a}
+.kbl{display:flex;justify-content:space-between;font-size:10px;color:var(--mute);margin-top:5px;letter-spacing:.06em}
+.kbl i{font-style:normal;display:inline-block;width:8px;height:8px;border-radius:2px;margin:0 4px 0 8px;vertical-align:-1px}
+/* lead pads */
+.lpads{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:12px;touch-action:none;user-select:none;-webkit-user-select:none}
+.lp{position:relative;min-height:62px;border-radius:10px;border:1px solid var(--line);background:#120a0e;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;font-size:13px;letter-spacing:.06em;color:var(--text);
+  box-shadow:0 0 calc(var(--g,0)*26px) rgba(89,225,255,calc(var(--g,0)*.75)) inset;border-color:rgba(89,225,255,calc(.15 + var(--g,0)*.7));
+  transition:box-shadow .15s,border-color .15s,background .08s}
+.lp small{font-size:9px;color:var(--mute);letter-spacing:.1em}
+.lp.ct small{color:var(--red)}
+.lp.tonic{background:#1a0d12}
+.lp.now{background:#ffe27a;color:#1a1200;box-shadow:0 0 22px #ffe27a}
+.lp.now small{color:#5a4600}
+.lp .star{position:absolute;top:4px;right:6px;font-size:10px;color:var(--cyan)}
+.hint{font-size:11px;color:var(--mute);margin-top:8px;text-align:center;letter-spacing:.05em}
 footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;margin-top:22px;text-transform:uppercase}
 .offline .status{color:var(--mute);border-color:var(--line)}
 </style>
@@ -123,6 +149,14 @@ footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;ma
     <div class="presets" id="presets">
       <button data-i="0">DORMANT</button><button data-i="0.25">EERIE</button><button data-i="0.5">PULSE</button><button data-i="0.75">DRIVE</button><button data-i="1">PEAK</button>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>PLAY <small>hold a pad · slide to glide</small></h2>
+    <div class="kb" id="kb"></div>
+    <div class="kbl"><span><i style="background:#ff5f6d"></i>chord<i style="background:#b48cff"></i>keys<i style="background:#ff9a5c"></i>arp<i style="background:#38d6e6"></i>bass<i style="background:#ffe27a"></i>lead</span></div>
+    <div class="lpads" id="lpads"></div>
+    <div class="hint">glow = likely next note · <span style="color:var(--cyan)">★</span> = what the machine would play · red = chord tone</div>
   </section>
 
   <section class="card">
@@ -176,8 +210,100 @@ footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;ma
   <footer>every sound synthesized live · no samples</footer>
 </main>
 <script>
-const LAYERS = ["drone","pad","arp","bass","drums","lead","bells"];
 const $ = (s) => document.querySelector(s);
+const LAYERS = ["drone","pad","arp","bass","drums","lead","bells","keys"];
+const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const nname = (n) => NAMES[n % 12] + (Math.floor(n / 12) - 1);
+const LOW = 36, HIGH = 95;
+const isBlack = (n) => [1,3,6,8,10].includes(n % 12);
+
+// keyboard display
+const kb = $("#kb");
+const kbKeys = {};
+(function buildKeyboard(){
+  const whites = [];
+  for (let n = LOW; n <= HIGH; n++) if (!isBlack(n)) whites.push(n);
+  const ww = 100 / whites.length;
+  whites.forEach((n) => { const d = document.createElement("div"); d.className = "w"; kb.appendChild(d); kbKeys[n] = d; });
+  whites.forEach((n, i) => {
+    if (n + 1 <= HIGH && isBlack(n + 1)) {
+      const d = document.createElement("div"); d.className = "b";
+      d.style.left = `calc(${(i + 1) * ww}% - ${ww * 0.32}%)`; d.style.width = `${ww * 0.64}%`;
+      kb.appendChild(d); kbKeys[n + 1] = d;
+    }
+  });
+})();
+
+function renderKeyboard(s){
+  const N = s.notes; if (!N) return;
+  const scale = new Set(s.scale || []);
+  const chord = new Set(N.chord), keys = new Set(N.keys);
+  for (let n = LOW; n <= HIGH; n++) {
+    const el = kbKeys[n]; if (!el) continue;
+    let c = isBlack(n) ? "b" : "w";
+    if (!scale.has(n % 12)) c += " out";
+    if (n === N.lead) c += " lead";
+    else if (n === N.bass) c += " bass";
+    else if (n === N.arp) c += " arp";
+    else if (keys.has(n)) c += " keys";
+    else if (chord.has(n)) c += " chord";
+    if (el.className !== c) el.className = c;
+  }
+}
+
+// lead pads
+const lpads = $("#lpads");
+let padSig = "", curNote = -1, activePointer = null;
+function playNote(n){
+  if (n === curNote) return;
+  curNote = n;
+  fetch("/api/play?n=" + n, {cache:"no-store"}).catch(() => {});
+}
+function renderPads(s){
+  const pads = s.pads || []; const sig = pads.join(",");
+  if (sig !== padSig) {
+    padSig = sig; lpads.innerHTML = "";
+    // 3 rows of 5, lowest notes bottom-left
+    const order = [10,11,12,13,14, 5,6,7,8,9, 0,1,2,3,4];
+    for (const i of order) {
+      if (i >= pads.length) continue;
+      const b = document.createElement("div");
+      b.className = "lp"; b.dataset.n = pads[i];
+      b.innerHTML = `<span>${nname(pads[i])}</span><small>${["1","2","3","4","5","6","7"][i % 7]}</small>`;
+      lpads.appendChild(b);
+    }
+  }
+  const chordPcs = new Set((s.notes && s.notes.chord || []).map((n) => n % 12));
+  const best = Math.max(0.0001, ...(s.suggest || [0]));
+  lpads.querySelectorAll(".lp").forEach((b) => {
+    const n = +b.dataset.n; const i = pads.indexOf(n);
+    const p = (s.suggest || [])[i] || 0;
+    b.style.setProperty("--g", Math.min(1, p / best).toFixed(2));
+    b.classList.toggle("ct", chordPcs.has(n % 12));
+    b.classList.toggle("tonic", i % 7 === 0);
+    b.classList.toggle("now", s.notes && s.notes.lead === n);
+    const star = s.notes && s.notes.next === n;
+    let st = b.querySelector(".star");
+    if (star && !st) { st = document.createElement("span"); st.className = "star"; st.textContent = "★"; b.appendChild(st); }
+    if (!star && st) st.remove();
+  });
+}
+lpads.addEventListener("pointerdown", (e) => {
+  const p = e.target.closest(".lp"); if (!p) return;
+  e.preventDefault(); activePointer = e.pointerId;
+  try { lpads.setPointerCapture(e.pointerId); } catch(_) {}
+  buzz(); playNote(+p.dataset.n);
+});
+lpads.addEventListener("pointermove", (e) => {
+  if (e.pointerId !== activePointer) return;
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const p = el && el.closest(".lp");
+  if (p) playNote(+p.dataset.n);
+});
+const endTouch = (e) => { if (e.pointerId !== activePointer) return; activePointer = null; playNote(-1); };
+lpads.addEventListener("pointerup", endTouch);
+lpads.addEventListener("pointercancel", endTouch);
+window.addEventListener("blur", () => { if (curNote >= 0) playNote(-1); });
 const busy = {};
 const pending = {};
 const timers = {};
@@ -247,6 +373,8 @@ function render(s){
     showOut(el);
   }
   $("#inow").style.width = (s.intensity_now * 100).toFixed(1) + "%";
+  renderKeyboard(s);
+  renderPads(s);
   $("#key").textContent = s.key;
   $("#chord").textContent = s.chord || "·";
   $("#bar").textContent = s.bar;
@@ -272,14 +400,18 @@ function render(s){
   }
 }
 
-async function poll(){
-  try {
-    const r = await fetch("/api/state", {cache:"no-store"});
-    render(await r.json()); online(true);
-  } catch(e){ online(false); }
-  setTimeout(poll, 600);
+// live state via server-sent events (~12/s); falls back to polling
+if (window.EventSource) {
+  const es = new EventSource("/api/stream");
+  es.onmessage = (e) => { try { render(JSON.parse(e.data)); online(true); } catch(_) {} };
+  es.onerror = () => online(false);
+} else {
+  (async function poll(){
+    try { const r = await fetch("/api/state", {cache:"no-store"}); render(await r.json()); online(true); }
+    catch(e){ online(false); }
+    setTimeout(poll, 300);
+  })();
 }
-poll();
 </script>
 </body>
 </html>

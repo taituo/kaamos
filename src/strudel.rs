@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::params::{Shared, LAYERS};
+use crate::params::{Shared, LAYERS, NL};
 
 /// Everything needed to write one pattern (one pass of the chord loop) as code.
 /// Built by the engine at capture time; all notes are MIDI numbers.
@@ -32,7 +32,9 @@ pub struct Snapshot {
     pub bells: Vec<Vec<i32>>,
     pub drum_level: u8,
     pub drum_var: u8,
-    pub gains: [f32; 7],
+    /// keys comping: (start step, length in steps, notes) over the loop
+    pub keys: Vec<(u32, u32, Vec<i32>)>,
+    pub gains: [f32; NL],
     pub pad_cut: f32,
     pub arp_cut: f32,
     pub bass_cut: f32,
@@ -234,6 +236,37 @@ pub fn pattern_code(s: &Snapshot, name: &str) -> String {
             g(0.3 * s.gains[6])
         ),
     ));
+
+    // keys: electric piano comping, one bracketed group per bar
+    if !s.keys.is_empty() {
+        let key_bars: Vec<String> = (0..bars)
+            .map(|b| {
+                let ev: Vec<(u32, u32, String)> = s
+                    .keys
+                    .iter()
+                    .filter(|e| e.0 / 16 == b)
+                    .map(|(st, len, notes)| {
+                        let t = if notes.len() == 1 {
+                            nn(notes[0])
+                        } else {
+                            format!("[{}]", notes.iter().map(|&n| nn(n)).collect::<Vec<_>>().join(","))
+                        };
+                        (st - b * 16, *len, t)
+                    })
+                    .collect();
+                timeline(&ev, 16)
+            })
+            .collect();
+        layers.push((
+            7,
+            format!(
+                "note(\"{}\").slow({bars})\n    .s(\"gm_epiano1\").clip(1).room({:.2}).roomsize(4).gain({})",
+                per_bar(&key_bars),
+                room,
+                g(0.6 * s.gains[7])
+            ),
+        ));
+    }
 
     let mut out = format!(
         "// {name} · section {} · {} · {} · {bars} bars · intensity {:.2} · {:.0} bpm\nconst {name} = stack(\n",
@@ -465,7 +498,12 @@ mod tests {
             bells: vec![vec![76, 79, 83, 86]; 4],
             drum_level: 2,
             drum_var: 1,
-            gains: [0.8, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5],
+            keys: vec![
+                (0, 5, vec![57, 60, 64]),
+                (6, 3, vec![57, 60, 64]),
+                (32, 15, vec![53, 57, 60]),
+            ],
+            gains: [0.8, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5, 0.9],
             pad_cut: 1800.0,
             arp_cut: 1200.0,
             bass_cut: 400.0,

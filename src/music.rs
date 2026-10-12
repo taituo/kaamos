@@ -459,6 +459,195 @@ pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_ch
     out
 }
 
+// ------------------------------------------------------------------ playing along
+
+/// The engine keeps the tonic in MIDI 45..56; this maps a pitch class back to it.
+pub fn key_root(pc: i32) -> i32 {
+    45 + (pc - 9).rem_euclid(12)
+}
+
+pub fn in_scale(key: i32, mode: usize, n: i32) -> bool {
+    MODES[mode].iv.contains(&(n - key).rem_euclid(12))
+}
+
+/// Absolute scale-degree index of an in-scale note (tonic of `key` = 0).
+pub fn degree_of(key: i32, mode: usize, n: i32) -> Option<i32> {
+    let rel = n - key;
+    let pc = rel.rem_euclid(12);
+    MODES[mode]
+        .iv
+        .iter()
+        .position(|&x| x == pc)
+        .map(|i| rel.div_euclid(12) * 7 + i as i32)
+}
+
+/// The notes offered on the phone's lead pads: two octaves of the scale.
+pub fn lead_pads(key: i32, mode: usize) -> Vec<i32> {
+    (0..15).map(|d| deg(key + 12, mode, d)).collect()
+}
+
+/// How likely each candidate is as the next melody note, given the chord, the last two
+/// notes and the note the machine itself would play next. Returns probabilities (sum 1).
+///
+/// The rules are the ones melodies tend to follow: chord tones are stable, small steps
+/// beat leaps, a leap is usually answered by a step back the other way, the leading tone
+/// wants to rise to the tonic, the 4th likes to fall to the 3rd.
+pub fn suggest_next(
+    key: i32,
+    mode: usize,
+    chord_deg: i32,
+    prev: Option<i32>,
+    prev2: Option<i32>,
+    machine: Option<i32>,
+    cands: &[i32],
+) -> Vec<f32> {
+    let pc = |n: i32| n.rem_euclid(12);
+    let chord: Vec<i32> = (0..4).map(|j| pc(deg(key, mode, chord_deg + 2 * j))).collect();
+    let iv = &MODES[mode].iv;
+    let mut w: Vec<f32> = cands
+        .iter()
+        .map(|&n| {
+            let Some(dn) = degree_of(key, mode, n) else { return 0.0 };
+            let mut x = 1.0f32;
+            let p = pc(n);
+            if p == chord[0] {
+                x *= 3.2;
+            } else if p == chord[1] || p == chord[2] {
+                x *= 2.6;
+            } else if p == chord[3] {
+                x *= 1.4;
+            }
+            match prev.and_then(|q| degree_of(key, mode, q).map(|dq| (q, dq))) {
+                Some((q, dq)) => {
+                    let step = dn - dq;
+                    x *= match step.abs() {
+                        0 => 0.55,
+                        1 => 1.9,
+                        2 => 1.5,
+                        3 => 0.9,
+                        4 => 0.6,
+                        7 => 0.5,
+                        5 | 6 => 0.35,
+                        _ => 0.12,
+                    };
+                    if let Some(dr) = prev2.and_then(|r| degree_of(key, mode, r)) {
+                        let last = dq - dr;
+                        if last.abs() >= 3 && step.signum() == -last.signum() && step.abs() <= 2 {
+                            x *= 1.8;
+                        }
+                    }
+                    let qd = dq.rem_euclid(7);
+                    if qd == 6 && iv[6] == 11 && n == q + 1 {
+                        x *= 2.5;
+                    }
+                    if qd == 3 && step == -1 {
+                        x *= 1.5;
+                    }
+                }
+                None => {}
+            }
+            let r = (n as f32 - 74.0) / 12.0;
+            x *= (-0.5 * r * r).exp();
+            if machine == Some(n) {
+                x *= 2.4;
+            }
+            x
+        })
+        .collect();
+    let sum: f32 = w.iter().sum();
+    if sum > 0.0 {
+        for x in w.iter_mut() {
+            *x /= sum;
+        }
+    }
+    w
+}
+
+// ------------------------------------------------------------------ keys comping
+
+/// What a keys hit plays: the chord, or one tone of the broken-chord list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    Chord,
+    Tone(u8),
+}
+
+/// (step in bar, hit, length in steps, velocity)
+pub type KeysPat = &'static [(u8, Hit, f32, f32)];
+
+pub const KEYS_PATTERNS: [(&str, KeysPat); 7] = [
+    ("ballad", &[(0, Hit::Chord, 15.0, 0.8)]),
+    (
+        "push",
+        &[
+            (0, Hit::Chord, 5.0, 0.85),
+            (6, Hit::Chord, 3.0, 0.6),
+            (10, Hit::Chord, 5.0, 0.7),
+        ],
+    ),
+    (
+        "3+3+2",
+        &[
+            (0, Hit::Chord, 5.0, 0.8),
+            (6, Hit::Chord, 5.0, 0.65),
+            (12, Hit::Chord, 3.5, 0.55),
+        ],
+    ),
+    (
+        "broken",
+        &[
+            (0, Hit::Tone(0), 4.0, 0.75),
+            (2, Hit::Tone(1), 4.0, 0.5),
+            (4, Hit::Tone(2), 4.0, 0.6),
+            (6, Hit::Tone(3), 4.0, 0.5),
+            (8, Hit::Tone(4), 4.0, 0.65),
+            (10, Hit::Tone(3), 4.0, 0.5),
+            (12, Hit::Tone(2), 4.0, 0.55),
+            (14, Hit::Tone(1), 2.0, 0.5),
+        ],
+    ),
+    (
+        "stabs",
+        &[
+            (2, Hit::Chord, 1.2, 0.6),
+            (6, Hit::Chord, 1.2, 0.55),
+            (10, Hit::Chord, 1.2, 0.6),
+            (14, Hit::Chord, 1.2, 0.55),
+        ],
+    ),
+    (
+        "two-and",
+        &[
+            (0, Hit::Chord, 3.0, 0.8),
+            (4, Hit::Chord, 1.5, 0.45),
+            (6, Hit::Chord, 2.0, 0.6),
+            (10, Hit::Chord, 2.0, 0.65),
+            (12, Hit::Chord, 3.0, 0.5),
+        ],
+    ),
+    (
+        "slow-rise",
+        &[
+            (0, Hit::Tone(0), 16.0, 0.7),
+            (4, Hit::Tone(2), 12.0, 0.5),
+            (8, Hit::Tone(3), 8.0, 0.55),
+            (12, Hit::Tone(4), 4.0, 0.5),
+        ],
+    ),
+];
+
+/// Pick a comping pattern that suits the intensity.
+pub fn pick_keys_pattern(rng: &mut Rng, intensity: f32) -> usize {
+    let pool: &[usize] = if intensity < 0.4 {
+        &[0, 6, 3, 2]
+    } else if intensity < 0.75 {
+        &[1, 2, 3, 5]
+    } else {
+        &[1, 4, 5]
+    };
+    *rng.pick(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +663,27 @@ mod tests {
                 MODES[m].name
             );
         }
+    }
+
+    #[test]
+    fn suggestions_prefer_steps_and_chord_tones() {
+        let key = key_root(9); // A
+        let mode = 4; // aeolian
+        let pads = lead_pads(key, mode);
+        // previous note E5 (76) over Am: the strongest candidates should be near E5 and in Am
+        let p = suggest_next(key, mode, 0, Some(76), Some(74), None, &pads);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        let best = pads[p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0];
+        assert!((best - 76).abs() <= 4, "best {best}");
+        let pc = best.rem_euclid(12);
+        assert!([9, 0, 4].contains(&pc), "best {best} should be a chord tone of Am");
+        // the machine's own next note gets a boost
+        let q = suggest_next(key, mode, 0, Some(76), None, Some(79), &pads);
+        let i79 = pads.iter().position(|&n| n == 79).unwrap();
+        let r = suggest_next(key, mode, 0, Some(76), None, None, &pads);
+        assert!(q[i79] > r[i79]);
+        // out-of-scale notes never get suggested
+        assert_eq!(suggest_next(key, mode, 0, None, None, None, &[70])[0], 0.0);
     }
 
     #[test]

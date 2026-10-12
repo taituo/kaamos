@@ -430,6 +430,19 @@ impl Lead {
         self.gate = gate.max(1);
         self.env.gate_on();
     }
+    /// Let go of a held note (used for live playing; sequenced notes use their gate).
+    pub fn release(&mut self) {
+        self.gate = 0;
+        self.env.gate_off();
+    }
+    /// The note currently held down, if any.
+    pub fn held(&self) -> Option<i32> {
+        if self.env.active() && !self.env.releasing() {
+            Some(self.target.round() as i32)
+        } else {
+            None
+        }
+    }
     #[inline]
     pub fn process(&mut self, cutoff: f32, reso: f32) -> f32 {
         if !self.env.active() {
@@ -455,6 +468,111 @@ impl Lead {
         let fe = self.fenv.tick();
         let cut = cutoff * (1.3 * fe).exp2();
         self.filt.process(s, cut, reso, sr) * e * self.vel
+    }
+}
+
+// ================================================================ KEYS
+// DX-era FM electric piano: a warm 1:1 body pair plus a short 14:1 "tine" for the attack,
+// pitch-dependent decay, and a suitcase-style stereo tremolo.
+
+#[derive(Clone, Copy, Default)]
+struct KeyVoice {
+    on: bool,
+    f: f32,
+    ph_c: f32,
+    ph_m: f32,
+    ph_t: f32,
+    ph_tm: f32,
+    t: f32,
+    gate: u32,
+    vel: f32,
+    decay: f32,
+    rel: f32,
+    att: f32,
+}
+
+pub struct Keys {
+    v: Vec<KeyVoice>,
+    next: usize,
+    trem: f32,
+    sr: f32,
+}
+
+impl Keys {
+    pub fn new(sr: f32) -> Self {
+        Keys {
+            v: vec![KeyVoice::default(); 16],
+            next: 0,
+            trem: 0.0,
+            sr,
+        }
+    }
+
+    pub fn note_on(&mut self, midi: i32, vel: f32, gate: u32) {
+        // reuse a free voice, else the quietest one
+        let mut idx = self.next;
+        let mut best = f32::MAX;
+        for (i, v) in self.v.iter().enumerate() {
+            let lvl = if v.on {
+                v.vel * (-v.t / v.decay.max(0.01)).exp() * v.rel
+            } else {
+                -1.0
+            };
+            if lvl < best {
+                best = lvl;
+                idx = i;
+            }
+        }
+        self.next = (idx + 1) % self.v.len();
+        let decay = 2.4 * (-(midi as f32 - 60.0) / 24.0).exp2();
+        self.v[idx] = KeyVoice {
+            on: true,
+            f: mtof(midi as f32),
+            gate: gate.max(1),
+            vel: vel.clamp(0.0, 1.0),
+            decay,
+            rel: 1.0,
+            ..Default::default()
+        };
+    }
+
+    #[inline]
+    pub fn process(&mut self) -> (f32, f32) {
+        let sr = self.sr;
+        let dt = 1.0 / sr;
+        self.trem = (self.trem + 4.3 / sr).fract();
+        let p = 0.38 * (self.trem * TAU).sin();
+        let rel_c = (-1.0 / (0.16 * sr)).exp();
+        let mut mono = 0.0;
+        for v in self.v.iter_mut() {
+            if !v.on {
+                continue;
+            }
+            if v.gate > 0 {
+                v.gate -= 1;
+            } else {
+                v.rel *= rel_c;
+            }
+            v.att += (1.0 - v.att) * 0.08;
+            let t = v.t;
+            let env = (-t / v.decay).exp() * v.rel * v.att;
+            if env < 1e-4 && (v.gate == 0 || t > 8.0) {
+                v.on = false;
+                continue;
+            }
+            let body_i = (0.9 + 1.5 * v.vel) * (-t / 0.45).exp() + 0.22;
+            let body = (v.ph_c * TAU + body_i * (v.ph_m * TAU).sin()).sin();
+            let tine_i = 2.2 * v.vel * (-t / 0.025).exp();
+            let tine = (v.ph_t * TAU + tine_i * (v.ph_tm * TAU).sin()).sin() * (-t / 0.22).exp();
+            let inc = v.f * dt;
+            v.ph_c = (v.ph_c + inc).fract();
+            v.ph_m = (v.ph_m + inc * 1.0005).fract();
+            v.ph_t = (v.ph_t + inc).fract();
+            v.ph_tm = (v.ph_tm + inc * 14.0).fract();
+            v.t += dt;
+            mono += (0.78 * body + 0.32 * tine) * env * (0.35 + 0.65 * v.vel);
+        }
+        pan(mono, p)
     }
 }
 

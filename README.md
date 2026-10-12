@@ -2,7 +2,8 @@
 
 *Kaamos* is the Finnish polar night, the weeks when the sun never rises.
 This is a procedural 80s night-synth machine for it: arpeggiated analog synths, Juno pads,
-an ominous low drone, gated-reverb drums, FM bells and a wobbly VHS tape stage.
+an ominous low drone, a DX-style electric piano, gated-reverb drums, FM bells and a wobbly
+VHS tape stage.
 All of it is synthesized in Rust, live, forever. No samples, no plugins.
 
 ![KAAMOS running in the terminal](docs/terminal.png)
@@ -51,7 +52,7 @@ It starts quietly at intensity 0.3, fades in, and prints a link like
 | `[` `]` | space (reverb) |
 | `o` `p` | tape / VHS wear |
 | `-` `=` | volume |
-| `q w e r t y u` | layers drone / pad / arp / bass / drums / lead / bells: cycle **auto → on → off** |
+| `q w e r t y u i` | layers drone / pad / arp / bass / drums / lead / bells / keys: cycle **auto → on → off** |
 | `SPACE` | **BOOM**: sub drop + crash, for slide reveals (instant) |
 | `g` | riser that lands on a bar line |
 | `f` | drum fill on the next bar |
@@ -72,11 +73,33 @@ the intensity up for a build.
 The phone panel has the same controls plus big preset buttons
 (DORMANT · EERIE · PULSE · DRIVE · PEAK), REPEAT, LOCK, CAPTURE and the drift range.
 
+## Play along
+
+Both the terminal and the phone show a five-octave keyboard where the sounding notes
+light up: chord red, keys violet, arpeggio orange, bass cyan, lead yellow. Keys that are
+in the current key are brighter, so on a real keyboard you can see which notes are safe.
+
+The phone's **PLAY** pads are the scale (two octaves, out-of-key notes left out).
+Hold a pad to play the lead, slide across pads to glide between notes. While you play,
+the machine's own melody steps aside and comes back a few seconds after you stop.
+
+The pads glow with how likely each note is as the **next** note, from a small model of
+how melodies move: chord tones are stable, small steps beat leaps, a leap is answered by
+a step back the other way, the leading tone rises to the tonic, the 4th falls to the 3rd.
+The ★ marks the note the machine itself would play next. The terminal shows the same
+suggestions as ▲ marks under the keyboard.
+
+## Keys
+
+A DX-era FM electric piano (warm 1:1 body plus a short 14:1 tine, suitcase tremolo) comps
+the chords in the middle intensities. Each section picks a comping pattern: ballad
+whole notes, slow rising arpeggio, broken chords, 3+3+2, push, two-and or offbeat stabs.
+
 ## Capture to Strudel
 
 Press `c` (or CAPTURE on the phone) and the pattern that is playing is written as code to
 `kaamos-<seed>.strudel.js` in the current folder (`--export-dir` to change it):
-pad chords, arpeggio, bass line, melody, drums, drone and bells, with the filter and
+pad chords, arpeggio, bass line, melody, keys, drums, drone and bells, with the filter and
 reverb settings of that moment.
 
 Every capture with the same seed is **appended** to the same file as `p1`, `p2`, `p3` …,
@@ -104,8 +127,9 @@ kaamos render score.wav --minutes 4 --seed 7 \
 
 `--curve` automates intensity (`time:value`, times in seconds or `1m30`).
 `--events` fires any command at a time: triggers `boom fill riser next key loop export`,
-toggles `drift hold lock fade`, layers `arp=off` / `lead=on` / `drums=auto`, or params
-`darkness=0.9`, `bpm=100`, `space=0.8` … The render ends with a fade (`--no-fade` to skip).
+toggles `drift hold lock fade`, layers `arp=off` / `lead=on` / `keys=auto`, params
+`darkness=0.9`, `bpm=100`, `space=0.8`, or live lead notes `play=72` / `play=-1`.
+The render ends with a fade (`--no-fade` to skip).
 
 ## Pipe mode
 
@@ -114,19 +138,22 @@ using the sound card (builds without the `audio` feature can only do this and `r
 
 ## Web API
 
-`GET /api/state` returns JSON. `GET /api/cmd?c=<command>` runs the same commands as
-`--events` (URL-encode `=` as `%3D`), e.g. `curl "localhost:7878/api/cmd?c=boom"`.
+`GET /api/state` returns JSON, `GET /api/stream` streams it as server-sent events.
+`GET /api/cmd?c=<command>` runs the same commands as `--events` (URL-encode `=` as `%3D`),
+e.g. `curl "localhost:7878/api/cmd?c=boom"`. `GET /api/play?n=72` plays a lead note,
+`n=-1` releases it.
 Handy for triggering from Keynote/OBS scripts or a Stream Deck.
 
 ## Inside
 
 - `dsp.rs`: polyBLEP oscillators, zero-delay-feedback ladder filter, SVF, envelopes
 - `instruments.rs`: Juno pad, resonant arp, sequencer bass, drone + air, glide lead,
-  FM bells, 808/Linn-style drums, boom / crash / riser
+  FM bells, FM electric piano, 808/Linn-style drums, boom / crash / riser
 - `fx.rs`: ensemble chorus, ping-pong tape echo, 8-line FDN hall, gated reverb, tape
   machine (saturation, wow & flutter, hiss), look-ahead limiter
 - `music.rs`: modes ordered bright to dark, diatonic progressions, voice-led voicings,
-  arp motifs, bass patterns, phrase-based lead melodies
+  arp motifs, bass patterns, phrase-based lead melodies, keys comping patterns and the
+  next-note model
 - `engine.rs`: the clock, the composer (sections, key changes, fills, repeats) and the mix;
   intensity drives layer gains, filter openness, arp rate, drum patterns and sidechain pump
 - `strudel.rs`: pattern capture to Strudel code

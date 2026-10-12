@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::music;
 use crate::params::*;
 use crate::LiveInfo;
 
@@ -178,8 +179,8 @@ pub fn run(sh: &Arc<Shared>, info: &LiveInfo) -> Result<(), String> {
                     sh.nudge("volume", 0.05);
                     None
                 }
-                Key::Char(c) if b"qwertyu".contains(&c) => {
-                    let idx = b"qwertyu".iter().position(|&x| x == c).unwrap();
+                Key::Char(c) if b"qwertyui".contains(&c) => {
+                    let idx = b"qwertyui".iter().position(|&x| x == c).unwrap();
                     sh.cycle_layer(idx);
                     None
                 }
@@ -284,7 +285,6 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
             format!("{RED}● live{RST}")
         }
     ));
-    line(String::new());
     line(format!(
         "  {TXT}INTENSITY{RST} {RED}{}{RST} {TXT}{:.2}{RST} {DIM}now {:.2}{RST}   {TXT}DRIFT{RST} {}",
         bar(it, 30),
@@ -339,42 +339,144 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
         line(format!("  {TXT}EXPORT{RST}  {CYAN}{export}{RST}"));
     }
     line(String::new());
-    let keys = ['q', 'w', 'e', 'r', 't', 'y', 'u'];
-    for (i, name) in LAYERS.iter().enumerate() {
-        let m = sh.layer_mode[i].load(Relaxed) as usize % 3;
-        let mc = match m {
-            1 => HOT,
-            2 => DIM,
-            _ => TXT,
-        };
-        line(format!(
-            "  {DIM}{}{RST} {TXT}{:<6}{RST} {mc}{:<4}{RST} {RED}{}{RST}",
-            keys[i],
-            name,
-            MODE_NAMES[m],
-            bar(sh.st_levels[i].get(), 16)
-        ));
+    for row in piano(sh) {
+        line(row);
     }
     line(String::new());
+    let keys = ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i'];
+    let half = LAYERS.len().div_ceil(2);
+    for r in 0..half {
+        let mut row = String::from("  ");
+        for i in [r, r + half] {
+            if i >= LAYERS.len() {
+                continue;
+            }
+            let m = sh.layer_mode[i].load(Relaxed) as usize % 3;
+            let mc = match m {
+                1 => HOT,
+                2 => DIM,
+                _ => TXT,
+            };
+            row.push_str(&format!(
+                "{DIM}{}{RST} {TXT}{:<6}{RST} {mc}{:<4}{RST} {RED}{}{RST}      ",
+                keys[i],
+                LAYERS[i],
+                MODE_NAMES[m],
+                bar(sh.st_levels[i].get(), 14)
+            ));
+        }
+        line(row);
+    }
     line(format!("  {HOT}{}{RST}", flash.unwrap_or("")));
     line(format!(
         "  {DIM}↑↓ intensity · 1-9 jump · ←→ darkness · , . tempo · [ ] space · o p tape · - = volume{RST}"
     ));
     line(format!(
-        "  {DIM}q w e r t y u  layer auto/on/off · l repeat pattern +1 · L lock pattern · h hold chord{RST}"
+        "  {DIM}q w e r t y u i layers · l repeat +1 · L lock pattern · h hold chord · c capture{RST}"
     ));
     line(format!(
-        "  {DIM}SPACE boom · g riser · f fill · n next · k new key · c capture · z drift · x fade · Esc quit{RST}"
+        "  {DIM}SPACE boom · g riser · f fill · n next · k new key · z drift · x fade · Esc quit{RST}"
     ));
-    line(String::new());
-    match &info.url {
-        Some(u) => line(format!("  {TXT}phone panel{RST} {CYAN}{u}{RST}")),
-        None => line(format!("  {DIM}web panel off{RST}")),
-    }
+    let panel = match &info.url {
+        Some(u) => format!("{TXT}phone{RST} {CYAN}{u}{RST}"),
+        None => format!("{DIM}web panel off{RST}"),
+    };
     line(format!(
-        "  {DIM}audio: {} @ {} Hz · seed {}{RST}",
+        "  {panel}   {DIM}{} @ {} Hz · seed {}{RST}",
         info.device, info.rate, info.seed
     ));
     s.push_str("\x1b[J");
     s
+}
+
+// ------------------------------------------------------------------ keyboard
+
+const LOW: i32 = 36; // C2
+const HIGH: i32 = 95; // B6
+
+const C_CHORD: u8 = 203;
+const C_KEYS: u8 = 141;
+const C_ARP: u8 = 209;
+const C_BASS: u8 = 44;
+const C_LEAD: u8 = 228;
+
+fn is_black(n: i32) -> bool {
+    matches!(n.rem_euclid(12), 1 | 3 | 6 | 8 | 10)
+}
+
+fn cell(bg: u8) -> String {
+    format!("\x1b[48;5;{bg}m \x1b[0m")
+}
+
+/// A white-key cell with a thin dark line on its right edge (the gap between keys).
+fn edge(bg: u8) -> String {
+    format!("\x1b[48;5;{bg};38;5;236m▕\x1b[0m")
+}
+
+/// A five-octave keyboard: sounding notes light up, in-key keys are brighter than
+/// out-of-key ones, and ▲ marks show the likely next melody notes.
+fn piano(sh: &Shared) -> Vec<String> {
+    let (chord, keys, bass, arp, lead) = sh.sounding();
+    let key = sh.key_root();
+    let mode = sh.mode();
+    let (pads, probs) = sh.suggestions();
+    let color = |n: i32| -> u8 {
+        if n == lead {
+            C_LEAD
+        } else if n == bass {
+            C_BASS
+        } else if n == arp {
+            C_ARP
+        } else if keys.contains(&n) {
+            C_KEYS
+        } else if chord.contains(&n) {
+            C_CHORD
+        } else {
+            let inkey = music::in_scale(key, mode, n);
+            match (is_black(n), inkey) {
+                (false, true) => 253,
+                (false, false) => 244,
+                (true, true) => 239,
+                (true, false) => 234,
+            }
+        }
+    };
+    let prob = |n: i32| pads.iter().position(|&p| p == n).map(|i| probs[i]).unwrap_or(0.0);
+    let mark = |p: f32| -> String {
+        if p > 0.15 {
+            format!("\x1b[1;38;5;220m▲{RST}")
+        } else if p > 0.08 {
+            format!("\x1b[38;5;178m▲{RST}")
+        } else if p > 0.04 {
+            format!("\x1b[38;5;94m·{RST}")
+        } else {
+            " ".into()
+        }
+    };
+    let whites: Vec<i32> = (LOW..=HIGH).filter(|&n| !is_black(n)).collect();
+    let (mut top, mut bottom, mut hint, mut labels) = (
+        String::from("  "),
+        String::from("  "),
+        String::from("  "),
+        String::from("  "),
+    );
+    for &w in &whites {
+        let b = w + 1;
+        let has_black = b <= HIGH && is_black(b);
+        top.push_str(&cell(color(w)));
+        top.push_str(&if has_black { cell(color(b)) } else { edge(color(w)) });
+        bottom.push_str(&cell(color(w)));
+        bottom.push_str(&edge(color(w)));
+        hint.push_str(&mark(prob(w)));
+        hint.push_str(&if has_black { mark(prob(b)) } else { " ".into() });
+        if w.rem_euclid(12) == 0 {
+            labels.push_str(&format!("{DIM}C{}{RST}", w / 12 - 1));
+        } else {
+            labels.push_str("  ");
+        }
+    }
+    let legend = format!(
+        "  \x1b[38;5;{C_CHORD}m■{RST}{DIM} chord {RST}\x1b[38;5;{C_KEYS}m■{RST}{DIM} keys {RST}\x1b[38;5;{C_ARP}m■{RST}{DIM} arp {RST}\x1b[38;5;{C_BASS}m■{RST}{DIM} bass {RST}\x1b[38;5;{C_LEAD}m■{RST}{DIM} lead   {RST}\x1b[1;38;5;220m▲{RST}{DIM} likely next note   bright keys = in key{RST}"
+    );
+    vec![top.clone(), top, bottom, hint, labels, legend]
 }
