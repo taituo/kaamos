@@ -1,4 +1,4 @@
-//! KAAMOS — a procedural 80s night-synth machine.
+//! KAAMOS: a procedural 80s night-synth machine.
 //! Every sound is synthesized in code: no samples, no plugins.
 
 mod dsp;
@@ -8,6 +8,7 @@ mod instruments;
 mod music;
 mod params;
 mod render;
+mod strudel;
 mod tui;
 mod web;
 
@@ -22,7 +23,7 @@ use std::time::Duration;
 use params::Shared;
 
 const USAGE: &str = "\
-KAAMOS — procedural 80s night-synth machine
+KAAMOS · procedural 80s night-synth machine
 
 LIVE (default)
   kaamos [options]
@@ -40,6 +41,7 @@ LIVE (default)
   --stdout        write raw s16le stereo PCM to stdout instead of the sound card
                   e.g.  kaamos --stdout | ffplay -f s16le -ar 48000 -ac 2 -nodisp -
   --rate N        sample rate for --stdout / render (default 48000)
+  --export-dir D  where pattern captures (key c) are written (default: current folder)
 
 RENDER
   kaamos render [out.wav] [options]
@@ -50,7 +52,8 @@ RENDER
   (all live options like --seed --darkness --bpm also work)
 
 EVENT / WEB COMMANDS
-  triggers: boom fill riser next key        toggles: drift hold fade (or drift=on)
+  triggers: boom fill riser next key loop export
+  toggles:  drift hold lock fade (or lock=on)
   layers:   drone pad arp bass drums lead bells  =auto|on|off|cycle
   params:   intensity darkness bpm space tape volume drift_min drift_max =value
 ";
@@ -69,6 +72,7 @@ pub struct Opts {
     pub curve: Option<String>,
     pub events: Option<String>,
     pub no_fade: bool,
+    pub export_dir: String,
 }
 
 impl Opts {
@@ -87,6 +91,7 @@ impl Opts {
             curve: None,
             events: None,
             no_fade: false,
+            export_dir: ".".into(),
         };
         let mut i = 0;
         while i < args.len() {
@@ -123,6 +128,7 @@ impl Opts {
                 "--curve" => o.curve = Some(val(flag)?),
                 "--events" => o.events = Some(val(flag)?),
                 "--no-fade" => o.no_fade = true,
+                "--export-dir" => o.export_dir = val(flag)?,
                 _ if render && !a.starts_with("--") && o.output.is_none() => o.output = Some(a.to_string()),
                 _ => return Err(format!("unknown option '{a}' (try: kaamos help)")),
             }
@@ -220,6 +226,16 @@ fn live(o: &Opts) -> Result<(), String> {
             );
         }
     };
+
+    // pattern captures -> Strudel files (written off the audio thread)
+    {
+        let sh = sh.clone();
+        let mut ex = strudel::Exporter::new(&o.export_dir);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(150));
+            ex.flush(&sh);
+        });
+    }
 
     let url = if o.port != 0 {
         match web::spawn(sh.clone(), &o.bind, o.port) {

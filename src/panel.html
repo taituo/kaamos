@@ -84,11 +84,16 @@ button{
 button:active{transform:scale(.96)}
 .presets button.sel{border-color:var(--red);color:var(--red);box-shadow:0 0 12px rgba(255,45,69,.35) inset}
 .pads{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.badge{color:var(--cyan);text-shadow:0 0 8px rgba(89,225,255,.6);letter-spacing:.05em}
+.pattern{margin:12px 2px 0;font-size:12px;color:var(--mute);letter-spacing:.08em;text-align:center}
+.pattern b{color:var(--cyan);font-weight:600}
+.pattern.locked b{color:var(--red)}
+.pattern.export{margin-top:4px;color:var(--cyan);font-size:11px;min-height:14px;word-break:break-all}
 .pad{min-height:64px;font-size:14px;letter-spacing:.25em;font-weight:700}
 .pad.big{grid-column:span 2;min-height:84px;font-size:22px;letter-spacing:.5em;color:var(--red);border-color:var(--red2);
   text-shadow:0 0 12px rgba(255,45,69,.7);background:radial-gradient(circle at 50% 50%, rgba(255,45,69,.16), #160b10 70%)}
 .pad.hit{background:var(--red);color:#000;box-shadow:0 0 40px var(--red)}
-.toggles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.toggles{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
 .tog.on{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 14px rgba(89,225,255,.35) inset;text-shadow:0 0 8px rgba(89,225,255,.6)}
 .layers{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
 .layer{display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:10px 10px 9px;text-align:left;min-height:66px}
@@ -108,7 +113,7 @@ footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;ma
   <header>
     <h1 class="logo">KAAMOS</h1>
     <div class="sub">procedural night synth</div>
-    <div class="status"><i class="dot" id="dot"></i><span id="key">—</span><span class="sep">·</span><span id="chord">—</span><span class="sep">·</span><span>bar <span id="bar">0</span></span><span class="sep">·</span><span><span id="bpmv">92</span> bpm</span></div>
+    <div class="status"><i class="dot" id="dot"></i><span id="key">·</span><span class="sep">·</span><span id="chord">·</span><span class="sep">·</span><span>bar <span id="bar">0</span></span><span class="sep">·</span><span><span id="bpmv">92</span> bpm</span></div>
   </header>
 
   <section class="card hero">
@@ -128,11 +133,16 @@ footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;ma
       <button class="pad" data-cmd="fill">FILL</button>
       <button class="pad" data-cmd="next">NEXT</button>
       <button class="pad" data-cmd="key">NEW KEY</button>
+      <button class="pad" data-cmd="loop">REPEAT <span id="loops" class="badge"></span></button>
+      <button class="pad" data-cmd="export">CAPTURE</button>
     </div>
+    <div class="pattern" id="pattern">pattern</div>
+    <div class="pattern export" id="export"></div>
     <div class="toggles">
-      <button class="tog" data-tog="drift">DRIFT</button>
+      <button class="tog" data-tog="lock">LOCK</button>
       <button class="tog" data-tog="hold">HOLD</button>
-      <button class="tog" data-tog="fade">FADE OUT</button>
+      <button class="tog" data-tog="drift">DRIFT</button>
+      <button class="tog" data-tog="fade">FADE</button>
     </div>
   </section>
 
@@ -238,9 +248,16 @@ function render(s){
   }
   $("#inow").style.width = (s.intensity_now * 100).toFixed(1) + "%";
   $("#key").textContent = s.key;
-  $("#chord").textContent = s.chord || "—";
+  $("#chord").textContent = s.chord || "·";
   $("#bar").textContent = s.bar;
   $("#bpmv").textContent = Math.round(s.bpm);
+  $("#loops").textContent = s.loops > 0 ? "+" + s.loops : "+1";
+  $("#export").textContent = s.export || "";
+  const p = $("#pattern");
+  p.classList.toggle("locked", !!s.lock);
+  p.innerHTML = s.hold ? "chord <b>held</b>"
+    : s.lock ? `${s.loop_bars}-bar pattern <b>locked</b>`
+    : `${s.loop_bars}-bar pattern · changes in <b>${s.bars_left}</b> bars`;
   document.querySelectorAll("#presets button").forEach((b) => {
     b.classList.toggle("sel", Math.abs(Number(b.dataset.i) - s.intensity) < 0.02);
   });

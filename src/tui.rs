@@ -1,5 +1,5 @@
 //! Terminal control surface. Talks to /dev/tty directly (so stdout stays free
-//! for --stdout audio) and uses `stty` for raw keys — no extra crates.
+//! for --stdout audio) and uses `stty` for raw keys, no extra crates.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -207,6 +207,22 @@ pub fn run(sh: &Arc<Shared>, info: &LiveInfo) -> Result<(), String> {
                     sh.toggle("hold");
                     None
                 }
+                Key::Char(b'l') => {
+                    sh.fire("loop");
+                    Some("pattern repeats +1")
+                }
+                Key::Char(b'c') => {
+                    sh.fire("export");
+                    Some("capturing pattern for Strudel...")
+                }
+                Key::Char(b'L') => {
+                    sh.toggle("lock");
+                    Some(if sh.lock.load(Relaxed) {
+                        "pattern LOCKED"
+                    } else {
+                        "pattern released"
+                    })
+                }
                 Key::Char(b'z') => {
                     sh.toggle("drift");
                     None
@@ -261,7 +277,7 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
     let fader = sh.st_master.get();
     line(String::new());
     line(format!(
-        "  {HOT}K A A M O S{RST}  {DIM}— procedural night synth —{RST}   {}",
+        "  {HOT}K A A M O S{RST}  {DIM}· procedural night synth ·{RST}   {}",
         if fader < 0.999 && sh.fade.load(Relaxed) {
             format!("{RED}fading out{RST}")
         } else {
@@ -299,6 +315,29 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
         sh.st_section.load(Relaxed),
         bar(sh.st_peak.get(), 8)
     ));
+    let loops = sh.st_loops.load(Relaxed);
+    let left = sh.st_bars_left.load(Relaxed);
+    let status = if sh.hold.load(Relaxed) {
+        format!("{HOT}chord held{RST}")
+    } else if sh.lock.load(Relaxed) {
+        format!("{HOT}LOCKED{RST} {TXT}repeating until released{RST}")
+    } else if loops > 0 {
+        format!("{HOT}+{loops} repeats{RST} {DIM}· changes in {left} bars{RST}")
+    } else {
+        format!("{DIM}changes in {left} bars{RST}")
+    };
+    line(format!(
+        "  {TXT}PATTERN{RST} {CYAN}{} bars{RST}   {status}",
+        sh.st_loop_bars.load(Relaxed)
+    ));
+    let export = sh.export_msg.lock().map(|s| s.clone()).unwrap_or_default();
+    if export.is_empty() {
+        line(format!(
+            "  {DIM}EXPORT  press c to capture this pattern as Strudel code{RST}"
+        ));
+    } else {
+        line(format!("  {TXT}EXPORT{RST}  {CYAN}{export}{RST}"));
+    }
     line(String::new());
     let keys = ['q', 'w', 'e', 'r', 't', 'y', 'u'];
     for (i, name) in LAYERS.iter().enumerate() {
@@ -322,10 +361,10 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
         "  {DIM}↑↓ intensity · 1-9 jump · ←→ darkness · , . tempo · [ ] space · o p tape · - = volume{RST}"
     ));
     line(format!(
-        "  {DIM}q w e r t y u  layer auto/on/off · h hold · z drift · x fade out/in{RST}"
+        "  {DIM}q w e r t y u  layer auto/on/off · l repeat pattern +1 · L lock pattern · h hold chord{RST}"
     ));
     line(format!(
-        "  {DIM}SPACE boom · g riser · f fill · n next section · k new key · Esc quit{RST}"
+        "  {DIM}SPACE boom · g riser · f fill · n next · k new key · c capture · z drift · x fade · Esc quit{RST}"
     ));
     line(String::new());
     match &info.url {

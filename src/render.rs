@@ -147,6 +147,7 @@ pub fn run(opts: &Opts) -> Result<(), String> {
     }
 
     let mut eng = Engine::new(rate as f32, sh.clone(), seed);
+    let mut ex = crate::strudel::Exporter::new(&opts.export_dir);
     let mut wav = WavWriter::create(&path, rate).map_err(|e| format!("cannot write {path}: {e}"))?;
     let total = (secs * rate as f32) as u64;
     let fade_len = if opts.no_fade { 0.0 } else { (secs * 0.25).min(8.0) };
@@ -158,6 +159,11 @@ pub fn run(opts: &Opts) -> Result<(), String> {
 
     for n in 0..total {
         let t = n as f32 / rate as f32;
+        if n % rate as u64 == 0 {
+            if let Some(m) = ex.flush(&sh) {
+                eprintln!("  {m}");
+            }
+        }
         if n % 64 == 0 {
             if !curve.is_empty() {
                 sh.intensity.set(eval_curve(&curve, t));
@@ -192,6 +198,13 @@ pub fn run(opts: &Opts) -> Result<(), String> {
         }
     }
     wav.finish().map_err(|e| e.to_string())?;
+    // captures fired in the last second still need writing (the engine queues them)
+    for _ in 0..64 {
+        eng.next();
+    }
+    if let Some(m) = ex.flush(&sh) {
+        eprintln!("  {m}");
+    }
     let rms = (sumsq / total as f64).sqrt() as f32;
     eprintln!(
         "kaamos: done. peak {:.1} dBFS, rms {:.1} dBFS, {} sections",

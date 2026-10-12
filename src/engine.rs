@@ -82,7 +82,11 @@ pub struct Engine {
     duck_rising: bool,
     drift_target: f32,
     drift_timer: f32,
-    trig_seen: [u32; 5],
+    trig_seen: [u32; N_TRIG],
+    extra_loops: u32,
+    was_locked: bool,
+    seed: u64,
+    export_pending: bool,
     ctl: u32,
     peak: f32,
     gate: f32,
@@ -122,6 +126,17 @@ pub struct Engine {
     tape: Tape,
     lim: Limiter,
     dc: [DcBlock; 2],
+}
+
+/// How many chord tones the pad uses: lush 9ths when calm, plain triads at the peak.
+fn chord_ext(i: f32) -> usize {
+    if i < 0.4 {
+        5
+    } else if i < 0.78 {
+        4
+    } else {
+        3
+    }
 }
 
 fn auto_gain(layer: usize, i: f32) -> f32 {
@@ -195,6 +210,10 @@ impl Engine {
             drift_target: 0.4,
             drift_timer: 0.0,
             trig_seen: std::array::from_fn(|i| sh.triggers[i].load(Relaxed)),
+            extra_loops: 0,
+            was_locked: false,
+            seed,
+            export_pending: false,
             ctl: 0,
             peak: 0.0,
             gate: 0.0,
@@ -282,8 +301,14 @@ impl Engine {
         for t in 0..TRIGGERS.len() {
             let v = sh.triggers[t].load(Relaxed);
             if v != self.trig_seen[t] {
+                // count every press (several can land in one control block), except
+                // for one-shots where a burst should still fire only once
+                let presses = v.wrapping_sub(self.trig_seen[t]).min(99);
                 self.trig_seen[t] = v;
-                self.on_trigger(t);
+                let n = if t == T_LOOP { presses } else { 1 };
+                for _ in 0..n {
+                    self.on_trigger(t);
+                }
             }
         }
 
@@ -347,6 +372,17 @@ impl Engine {
         }
         sh.st_peak.set(self.peak);
         sh.st_master.set(self.fader);
+        if self.export_pending {
+            // never block the audio thread: if the exporter holds the lock, retry next block
+            if let Ok(mut caps) = sh.captures.try_lock() {
+                caps.push(self.snapshot());
+                self.export_pending = false;
+            }
+        }
+        let left = self.sec_bars.saturating_sub(self.bar_in_sec) + self.extra_loops * self.loop_bars;
+        sh.st_bars_left.store(left, Relaxed);
+        sh.st_loops.store(self.extra_loops, Relaxed);
+        sh.st_loop_bars.store(self.loop_bars, Relaxed);
         self.peak *= 0.97;
     }
 
@@ -366,7 +402,12 @@ impl Engine {
                 let samples = ((1.0 - self.step_phase).max(0.0) + n) * self.sps();
                 self.imp.riser(samples);
             }
-            T_NEXT => self.want_next = true,
+            T_NEXT => {
+                self.want_next = true;
+                self.extra_loops = 0;
+            }
+            T_LOOP => self.extra_loops = (self.extra_loops + 1).min(99),
+            T_EXPORT => self.export_pending = true,
             T_KEY => {
                 self.want_key = true;
                 self.want_next = true;
@@ -452,38 +493,132 @@ impl Engine {
         self.chord_idx = ci;
         self.chord_deg = self.prog[ci % self.prog.len()];
         let i = self.inten;
-        let ext = if i < 0.4 {
-            5
-        } else if i < 0.78 {
-            4
-        } else {
-            3
-        };
-        let v = voicing(self.key + 12, self.mode, self.chord_deg, ext, 64.0);
+        let ext = chord_ext(i);
+        let notes = self.pad_notes(self.chord_deg, i);
+        let low = i > 0.6;
+        let upper = if low { &notes[1..] } else { &notes[..] };
         self.pad.release_all();
         let attack = 2.6 - 2.1 * i;
-        let vel = 0.62 / (v.len() as f32).sqrt();
-        for &n in &v {
+        let vel = 0.62 / (upper.len() as f32).sqrt();
+        for &n in upper {
             self.pad.note_on(n, vel, attack, 3.6, 1.0);
         }
+        if low {
+            self.pad.note_on(notes[0], vel * 0.8, attack, 3.0, 0.7);
+        }
+        self.arp_notes = arp_tones(self.key, self.mode, self.chord_deg, 4, 57);
+        self.bass_root = self.bass_root_for(self.chord_deg);
+        if let Ok(mut s) = self.sh.st_chord.try_lock() {
+            *s = chord_name(self.key, self.mode, self.chord_deg, ext);
+        }
+    }
+
+    /// Pad notes for a chord: close voicing, plus a low root at higher intensity (first).
+    fn pad_notes(&self, d: i32, i: f32) -> Vec<i32> {
+        let mut v = voicing(self.key + 12, self.mode, d, chord_ext(i), 64.0);
         if i > 0.6 {
-            let mut low = deg(self.key, self.mode, self.chord_deg);
+            let mut low = deg(self.key, self.mode, d);
             while low > v[0] - 7 {
                 low -= 12;
             }
-            self.pad.note_on(low, vel * 0.8, attack, 3.0, 0.7);
+            v.insert(0, low);
         }
-        self.arp_notes = arp_tones(self.key, self.mode, self.chord_deg, 4, 57);
-        let mut b = deg(self.key - 12, self.mode, self.chord_deg);
+        v
+    }
+
+    fn bass_root_for(&self, d: i32) -> i32 {
+        let mut b = deg(self.key - 12, self.mode, d);
         while b > 43 {
             b -= 12;
         }
         while b < 31 {
             b += 12;
         }
-        self.bass_root = b;
-        if let Ok(mut s) = self.sh.st_chord.try_lock() {
-            *s = chord_name(self.key, self.mode, self.chord_deg, ext);
+        b
+    }
+
+    /// One pass of the current chord loop, exactly as the engine plays it, for export.
+    fn snapshot(&self) -> crate::strudel::Snapshot {
+        let i = self.inten;
+        let bars = self.loop_bars.max(1);
+        let bpc = self.bpc.max(1);
+        let chord_at = |b: u32| self.prog[((b / bpc) as usize) % self.prog.len()];
+
+        let pad = (0..bars).map(|b| self.pad_notes(chord_at(b), i)).collect();
+
+        let rate = self.arp_rate.max(1);
+        let mut arp = Vec::new();
+        let mut count = 0usize;
+        for b in 0..bars {
+            let tones = arp_tones(self.key, self.mode, chord_at(b), 4, 57);
+            let n = tones.len().max(1);
+            for _ in 0..(16 / rate) {
+                let idx = self.motif[count % self.motif.len()];
+                arp.push(tones[idx % n] + 12 * (idx / n) as i32);
+                count += 1;
+            }
+        }
+
+        let pats: [&[BassPat]; 3] = [BASS_LOW, BASS_MID, BASS_HIGH];
+        let lvl = self.bass_level.min(2);
+        let pat = pats[lvl][self.bass_pats[lvl] % pats[lvl].len()];
+        let mut bass = Vec::new();
+        for b in 0..bars {
+            let root = self.bass_root_for(chord_at(b));
+            for &(st, off, len, _) in pat {
+                bass.push((b * 16 + st as u32, len.round().max(1.0) as u32, root + off as i32));
+            }
+        }
+
+        let lead = self.lead_line.iter().map(|n| (n.start, n.dur, n.midi)).collect();
+        let bells = (0..bars)
+            .map(|b| {
+                let d = chord_at(b);
+                (0..4)
+                    .map(|j| {
+                        let mut n = deg(self.key + 24, self.mode, d + 2 * j);
+                        while n < 74 {
+                            n += 12;
+                        }
+                        while n > 93 {
+                            n -= 12;
+                        }
+                        n
+                    })
+                    .collect()
+            })
+            .collect();
+        let ext = chord_ext(i);
+        crate::strudel::Snapshot {
+            seed: self.seed,
+            section: self.section,
+            key_name: format!(
+                "{} {}",
+                NOTE_NAMES[self.key.rem_euclid(12) as usize],
+                MODES[self.mode].name
+            ),
+            chord_names: self
+                .prog
+                .iter()
+                .map(|&d| chord_name(self.key, self.mode, d, ext))
+                .collect(),
+            bpm: self.bpm,
+            intensity: i,
+            space: self.space,
+            loop_bars: bars,
+            pad,
+            arp,
+            bass,
+            lead,
+            drone: self.key - 12,
+            bells,
+            drum_level: self.drum_level,
+            drum_var: self.drum_var,
+            gains: self.gains,
+            pad_cut: self.c_pad_cut,
+            arp_cut: self.c_arp_cut,
+            bass_cut: self.c_bass_cut,
+            lead_cut: self.c_lead_cut,
         }
     }
 
@@ -549,6 +684,19 @@ impl Engine {
             2
         };
 
+        // pattern lock / repeats: instead of moving on, play the chord loop again
+        let lock = self.sh.lock.load(Relaxed);
+        if self.was_locked && !lock {
+            self.extra_loops = 0; // releasing the lock also drops queued repeats
+        }
+        self.was_locked = lock;
+        if !hold && !self.want_next && self.bar_in_sec >= self.sec_bars && (lock || self.extra_loops > 0) {
+            if !lock {
+                self.extra_loops -= 1;
+            }
+            self.sec_bars += self.loop_bars.max(1);
+        }
+
         let new_sec = self.want_next || (!hold && self.bar_in_sec >= self.sec_bars);
         if new_sec {
             self.new_section();
@@ -560,7 +708,8 @@ impl Engine {
 
         // fills
         self.fill_forced = self.want_fill;
-        let auto_fill = (self.drum_level >= 2 && self.bar_in_sec + 1 == self.sec_bars && self.rng.chance(0.75))
+        let section_end = self.bar_in_sec + 1 == self.sec_bars && !lock && self.extra_loops == 0;
+        let auto_fill = (self.drum_level >= 2 && section_end && self.rng.chance(0.75))
             || (self.drum_level == 3 && self.bar_in_sec % 4 == 3 && self.rng.chance(0.25));
         self.fill_bar = self.want_fill || auto_fill;
         self.fill_kind = if self.drum_level >= 2 {
@@ -849,5 +998,56 @@ impl Engine {
         let l = self.dc[0].process(l * m);
         let r = self.dc[1].process(r * m);
         (l, r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: f32 = 8000.0;
+
+    fn run_bars(e: &mut Engine, bars: f32) {
+        let n = (bars * 4.0 * 60.0 / 92.0 * SR) as usize;
+        for _ in 0..n {
+            e.next();
+        }
+    }
+
+    #[test]
+    fn lock_keeps_the_pattern() {
+        let sh = Arc::new(Shared::new());
+        sh.set_param("intensity", 0.6);
+        let mut e = Engine::new(SR, sh.clone(), 42);
+        run_bars(&mut e, 0.5);
+        let s0 = sh.st_section.load(Relaxed);
+        sh.lock.store(true, Relaxed);
+        run_bars(&mut e, 40.0);
+        assert_eq!(sh.st_section.load(Relaxed), s0, "locked pattern must not change");
+        sh.lock.store(false, Relaxed);
+        run_bars(&mut e, 40.0);
+        assert!(sh.st_section.load(Relaxed) > s0, "released pattern moves on");
+    }
+
+    #[test]
+    fn repeats_extend_by_whole_loops() {
+        let sh = Arc::new(Shared::new());
+        sh.set_param("intensity", 0.6);
+        let mut e = Engine::new(SR, sh.clone(), 7);
+        run_bars(&mut e, 0.5);
+        let left0 = sh.st_bars_left.load(Relaxed);
+        let lb = sh.st_loop_bars.load(Relaxed);
+        for _ in 0..3 {
+            sh.fire("loop");
+        }
+        run_bars(&mut e, 0.1);
+        assert_eq!(sh.st_loops.load(Relaxed), 3);
+        let left = sh.st_bars_left.load(Relaxed);
+        assert_eq!(left, left0 + 3 * lb);
+        let s0 = sh.st_section.load(Relaxed);
+        run_bars(&mut e, left as f32 - 1.0);
+        assert_eq!(sh.st_section.load(Relaxed), s0, "still repeating");
+        run_bars(&mut e, 1.0);
+        assert_eq!(sh.st_section.load(Relaxed), s0 + 1, "moves on after the repeats");
     }
 }

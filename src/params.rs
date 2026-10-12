@@ -28,12 +28,15 @@ pub const L_DRUMS: usize = 4;
 pub const L_LEAD: usize = 5;
 pub const L_BELLS: usize = 6;
 
-pub const TRIGGERS: [&str; 5] = ["boom", "fill", "riser", "next", "key"];
+pub const TRIGGERS: [&str; 7] = ["boom", "fill", "riser", "next", "key", "loop", "export"];
+pub const N_TRIG: usize = TRIGGERS.len();
 pub const T_BOOM: usize = 0;
 pub const T_FILL: usize = 1;
 pub const T_RISER: usize = 2;
 pub const T_NEXT: usize = 3;
 pub const T_KEY: usize = 4;
+pub const T_LOOP: usize = 5;
+pub const T_EXPORT: usize = 6;
 
 pub const MODE_AUTO: u8 = 0;
 pub const MODE_ON: u8 = 1;
@@ -52,10 +55,12 @@ pub struct Shared {
     pub drift_max: AF,
     pub drift: AtomicBool,
     pub hold: AtomicBool,
+    /// keep repeating the current pattern (progression, motif, bass, melody) until released
+    pub lock: AtomicBool,
     pub fade: AtomicBool,
     pub quitting: AtomicBool,
     pub layer_mode: [AtomicU8; 7],
-    pub triggers: [AtomicU32; 5],
+    pub triggers: [AtomicU32; N_TRIG],
     // ---- status (written by engine)
     pub st_intensity: AF,
     pub st_levels: [AF; 7],
@@ -66,6 +71,12 @@ pub struct Shared {
     pub st_chord: std::sync::Mutex<String>,
     pub st_peak: AF,
     pub st_master: AF,
+    pub st_loops: AtomicU32,
+    pub st_bars_left: AtomicU32,
+    pub st_loop_bars: AtomicU32,
+    // ---- pattern capture (engine -> exporter)
+    pub captures: std::sync::Mutex<Vec<crate::strudel::Snapshot>>,
+    pub export_msg: std::sync::Mutex<String>,
 }
 
 impl Default for Shared {
@@ -87,6 +98,7 @@ impl Shared {
             drift_max: AF::new(0.75),
             drift: AtomicBool::new(false),
             hold: AtomicBool::new(false),
+            lock: AtomicBool::new(false),
             fade: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
             layer_mode: Default::default(),
@@ -100,6 +112,11 @@ impl Shared {
             st_chord: std::sync::Mutex::new(String::new()),
             st_peak: AF::new(0.0),
             st_master: AF::new(0.0),
+            st_loops: AtomicU32::new(0),
+            st_bars_left: AtomicU32::new(0),
+            st_loop_bars: AtomicU32::new(0),
+            captures: std::sync::Mutex::new(Vec::new()),
+            export_msg: std::sync::Mutex::new(String::new()),
         }
     }
 
@@ -147,6 +164,7 @@ impl Shared {
         match name {
             "drift" => Some(&self.drift),
             "hold" => Some(&self.hold),
+            "lock" => Some(&self.lock),
             "fade" => Some(&self.fade),
             _ => None,
         }
@@ -236,7 +254,7 @@ impl Shared {
             ));
         }
         format!(
-            "{{\"intensity\":{:.3},\"intensity_now\":{:.3},\"darkness\":{:.3},\"bpm\":{:.1},\"space\":{:.3},\"tape\":{:.3},\"volume\":{:.3},\"drift_min\":{:.3},\"drift_max\":{:.3},\"drift\":{},\"hold\":{},\"fade\":{},\"bar\":{},\"section\":{},\"key\":\"{}\",\"chord\":\"{}\",\"peak\":{:.3},\"layers\":{{{}}}}}",
+            "{{\"intensity\":{:.3},\"intensity_now\":{:.3},\"darkness\":{:.3},\"bpm\":{:.1},\"space\":{:.3},\"tape\":{:.3},\"volume\":{:.3},\"drift_min\":{:.3},\"drift_max\":{:.3},\"drift\":{},\"hold\":{},\"lock\":{},\"loops\":{},\"bars_left\":{},\"loop_bars\":{},\"fade\":{},\"bar\":{},\"section\":{},\"key\":\"{}\",\"chord\":\"{}\",\"peak\":{:.3},\"export\":\"{}\",\"layers\":{{{}}}}}",
             self.intensity.get(),
             self.st_intensity.get(),
             self.darkness.get(),
@@ -248,13 +266,31 @@ impl Shared {
             self.drift_max.get(),
             self.drift.load(Relaxed),
             self.hold.load(Relaxed),
+            self.lock.load(Relaxed),
+            self.st_loops.load(Relaxed),
+            self.st_bars_left.load(Relaxed),
+            self.st_loop_bars.load(Relaxed),
             self.fade.load(Relaxed),
             self.st_bar.load(Relaxed),
             self.st_section.load(Relaxed),
             self.key_name(),
             self.chord(),
             self.st_peak.get(),
+            json_escape(&self.export_msg.lock().map(|s| s.clone()).unwrap_or_default()),
             layers
         )
     }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push(' '),
+            c => o.push(c),
+        }
+    }
+    o
 }
