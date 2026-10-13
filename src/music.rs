@@ -364,7 +364,9 @@ pub struct LeadNote {
     pub midi: i32,
 }
 
-const RHYTHMS: &[&[(u32, u32)]] = &[
+type Rhythm = &'static [(u32, u32)];
+
+const RHYTHMS: &[Rhythm] = &[
     &[(0, 8), (8, 4), (12, 4), (16, 12), (28, 4)],
     &[(0, 6), (6, 6), (12, 4), (16, 16)],
     &[(0, 4), (4, 4), (8, 8), (16, 6), (22, 2), (24, 8)],
@@ -374,26 +376,105 @@ const RHYTHMS: &[&[(u32, u32)]] = &[
     &[(0, 16), (16, 8), (24, 8)],
 ];
 
+/// Verse: lower, sparser, room to breathe (rests between phrases).
+const VERSE_RHYTHMS: &[Rhythm] = &[
+    &[(0, 4), (4, 4), (8, 8), (24, 8)],
+    &[(2, 2), (4, 4), (8, 8), (18, 2), (20, 4), (24, 6)],
+    &[(0, 6), (6, 2), (8, 8), (16, 6), (22, 2), (24, 4)],
+    &[(0, 8), (8, 4), (12, 4), (16, 12)],
+    &[(4, 4), (8, 4), (12, 4), (16, 16)],
+];
+
+/// Chorus: higher, rhythmic, made to be remembered (3+3+2, straight 8ths, long held peaks).
+const CHORUS_RHYTHMS: &[Rhythm] = &[
+    &[(0, 3), (3, 3), (6, 2), (8, 8), (16, 3), (19, 3), (22, 2), (24, 8)],
+    &[(0, 4), (4, 4), (8, 4), (12, 4), (16, 8), (24, 8)],
+    &[(0, 8), (8, 8), (16, 6), (22, 2), (24, 8)],
+    &[(0, 2), (2, 2), (4, 4), (8, 8), (16, 2), (18, 2), (20, 4), (24, 8)],
+    &[(0, 6), (6, 6), (12, 4), (16, 16)],
+];
+
+/// How a melody is written: its register (scale degrees above the lead root), rhythm
+/// vocabulary, and how strongly later phrases repeat the first one.
+pub struct LeadStyle {
+    pub lo: i32,
+    pub hi: i32,
+    pub start: i32,
+    pub rhythms: &'static [Rhythm],
+    /// chance that phrases 3, 5, … repeat phrase 1
+    pub repeat: f32,
+    /// chance that a repeated note is literal rather than a sequence following the chord
+    pub literal: f32,
+    /// chance that the answering phrase reuses the first phrase's rhythm
+    pub same_rhythm: f32,
+}
+
+pub const FREE_STYLE: LeadStyle = LeadStyle {
+    lo: 3,
+    hi: 13,
+    start: 7,
+    rhythms: RHYTHMS,
+    repeat: 0.75,
+    literal: 0.5,
+    same_rhythm: 0.0,
+};
+pub const VERSE_STYLE: LeadStyle = LeadStyle {
+    lo: 0,
+    hi: 9,
+    start: 4,
+    rhythms: VERSE_RHYTHMS,
+    repeat: 0.8,
+    literal: 0.6,
+    same_rhythm: 0.3,
+};
+pub const CHORUS_STYLE: LeadStyle = LeadStyle {
+    lo: 4,
+    hi: 13,
+    start: 9,
+    rhythms: CHORUS_RHYTHMS,
+    repeat: 1.0,
+    literal: 0.75,
+    same_rhythm: 0.6,
+};
+
 /// Generate a lead line over one loop of the progression.
 /// Degrees are relative to `root` (tonic around MIDI 45-56); output in ~MIDI 62-86.
 pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_chord: u32) -> Vec<LeadNote> {
+    gen_lead_styled(rng, root, mode, prog, bars_per_chord, &FREE_STYLE)
+}
+
+pub fn gen_lead_styled(
+    rng: &mut Rng,
+    root: i32,
+    mode: usize,
+    prog: &[i32],
+    bars_per_chord: u32,
+    style: &LeadStyle,
+) -> Vec<LeadNote> {
     let loop_steps = prog.len() as u32 * bars_per_chord * 16;
     let phrases = (loop_steps / 32).max(1);
-    let ra = rng.below(RHYTHMS.len());
-    let mut rb = rng.below(RHYTHMS.len());
-    if rb == ra {
-        rb = (rb + 1) % RHYTHMS.len();
-    }
+    let rs = style.rhythms;
+    let ra = rng.below(rs.len());
+    let rb = if rng.chance(style.same_rhythm) {
+        ra
+    } else {
+        let mut b = rng.below(rs.len());
+        if b == ra {
+            b = (b + 1) % rs.len();
+        }
+        b
+    };
     let chord_at = |step: u32| prog[((step / 16 / bars_per_chord) as usize) % prog.len()];
     let lead_root = root + 12;
-    let (lo, hi) = (3, 13); // degree range
-    let mut prev: i32 = 7 + rng.below(3) as i32;
+    let (lo, hi) = (style.lo, style.hi);
+    let mut prev: i32 = style.start + rng.below(3) as i32;
     let mut out = Vec::new();
     let mut phrase_a: Vec<(i32, i32)> = Vec::new();
     for p in 0..phrases {
         let is_a = p % 2 == 0;
-        let rhythm = RHYTHMS[if is_a { ra } else { rb }];
+        let rhythm = rs[if is_a { ra } else { rb }];
         let last_phrase = p == phrases - 1;
+        let repeat_phrase = is_a && p >= 2 && rng.chance(style.repeat);
         for (ni, &(st, dur)) in rhythm.iter().enumerate() {
             let abs = p * 32 + st;
             if abs >= loop_steps {
@@ -403,10 +484,15 @@ pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_ch
             let strong = st % 8 == 0;
             let last_note = ni == rhythm.len() - 1;
             let mut d;
-            if is_a && p >= 2 && ni < phrase_a.len() && !(last_phrase && last_note) && rng.chance(0.75) {
+            if repeat_phrase && ni < phrase_a.len() && !(last_phrase && last_note) {
                 // repeat phrase A: literally, or as a diatonic sequence following the chord
                 let (ad, acd) = phrase_a[ni];
-                d = if rng.chance(0.5) { ad } else { ad + (cd - acd) };
+                let seq = ad + (cd - acd);
+                d = if rng.chance(style.literal) || seq < lo || seq > hi {
+                    ad
+                } else {
+                    seq
+                };
             } else if strong || last_note {
                 // nearest chord tone to prev, with a small random push
                 let push = rng.below(5) as i32 - 2;
@@ -438,6 +524,10 @@ pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_ch
             } else {
                 let step = *rng.pick(&[-2, -1, -1, 1, 1, 2]);
                 d = prev + step;
+                if d < lo || d > hi {
+                    // turn around at the edge of the range instead of jumping an octave
+                    d = prev - step;
+                }
             }
             while d < lo {
                 d += 7;
@@ -457,6 +547,20 @@ pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_ch
         }
     }
     out
+}
+
+/// A progression from the template list that passes `keep` (only major/minor triads).
+pub fn pick_prog_where(rng: &mut Rng, mode: usize, keep: impl Fn(&[i32]) -> bool) -> Option<Vec<i32>> {
+    let v: Vec<&[i32]> = valid_progs(mode).into_iter().filter(|p| keep(p)).collect();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v[rng.below(v.len())].to_vec())
+    }
+}
+
+pub fn is_major_or_minor(mode: usize, d: i32) -> bool {
+    matches!(triad_quality(mode, d), Quality::Maj | Quality::Min)
 }
 
 // ------------------------------------------------------------------ playing along

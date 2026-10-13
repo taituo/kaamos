@@ -351,6 +351,9 @@ impl Adsr {
         self.rc = coef(r, sr);
         self.sustain = s;
     }
+    pub fn set_release(&mut self, r: f32, sr: f32) {
+        self.rc = coef(r, sr);
+    }
     pub fn gate_on(&mut self) {
         self.stage = Stage::Attack;
     }
@@ -424,6 +427,10 @@ pub struct DelayLine {
 }
 
 impl DelayLine {
+    pub fn clear(&mut self) {
+        self.buf.iter_mut().for_each(|x| *x = 0.0);
+    }
+
     pub fn new(max_samples: usize) -> Self {
         let n = (max_samples + 4).next_power_of_two();
         DelayLine {

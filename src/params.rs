@@ -32,7 +32,7 @@ pub const L_LEAD: usize = 5;
 pub const L_BELLS: usize = 6;
 pub const L_KEYS: usize = 7;
 
-pub const TRIGGERS: [&str; 7] = ["boom", "fill", "riser", "next", "key", "loop", "export"];
+pub const TRIGGERS: [&str; 8] = ["boom", "fill", "riser", "next", "key", "loop", "export", "song"];
 pub const N_TRIG: usize = TRIGGERS.len();
 pub const T_BOOM: usize = 0;
 pub const T_FILL: usize = 1;
@@ -41,6 +41,7 @@ pub const T_NEXT: usize = 3;
 pub const T_KEY: usize = 4;
 pub const T_LOOP: usize = 5;
 pub const T_EXPORT: usize = 6;
+pub const T_SONG: usize = 7;
 
 pub const MODE_AUTO: u8 = 0;
 pub const MODE_ON: u8 = 1;
@@ -94,6 +95,11 @@ pub struct Shared {
     // ---- pattern capture (engine -> exporter)
     pub captures: std::sync::Mutex<Vec<crate::strudel::Snapshot>>,
     pub export_msg: std::sync::Mutex<String>,
+    // ---- song mode
+    pub st_song: std::sync::Mutex<String>,
+    pub st_song_on: AtomicBool,
+    /// counts finished songs (render stops when this changes)
+    pub song_done: AtomicU32,
 }
 
 impl Default for Shared {
@@ -145,6 +151,9 @@ impl Shared {
             st_loop_bars: AtomicU32::new(0),
             captures: std::sync::Mutex::new(Vec::new()),
             export_msg: std::sync::Mutex::new(String::new()),
+            st_song: std::sync::Mutex::new(String::new()),
+            st_song_on: AtomicBool::new(false),
+            song_done: AtomicU32::new(0),
         }
     }
 
@@ -273,6 +282,10 @@ impl Shared {
         format!("{} {}", crate::music::NOTE_NAMES[k], crate::music::MODES[m].name)
     }
 
+    pub fn song_status(&self) -> String {
+        self.st_song.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
     pub fn chord(&self) -> String {
         self.st_chord.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -355,7 +368,7 @@ impl Shared {
             probs.iter().map(|p| format!("{p:.3}")).collect::<Vec<_>>().join(",")
         );
         format!(
-            "{{\"intensity\":{:.3},\"intensity_now\":{:.3},\"darkness\":{:.3},\"bpm\":{:.1},\"space\":{:.3},\"tape\":{:.3},\"volume\":{:.3},\"drift_min\":{:.3},\"drift_max\":{:.3},\"drift\":{},\"hold\":{},\"lock\":{},\"loops\":{},\"bars_left\":{},\"loop_bars\":{},\"fade\":{},\"bar\":{},\"section\":{},\"key\":\"{}\",\"chord\":\"{}\",\"peak\":{:.3},\"export\":\"{}\",\"notes\":{},\"layers\":{{{}}}}}",
+            "{{\"intensity\":{:.3},\"intensity_now\":{:.3},\"darkness\":{:.3},\"bpm\":{:.1},\"space\":{:.3},\"tape\":{:.3},\"volume\":{:.3},\"drift_min\":{:.3},\"drift_max\":{:.3},\"drift\":{},\"hold\":{},\"lock\":{},\"loops\":{},\"bars_left\":{},\"loop_bars\":{},\"fade\":{},\"bar\":{},\"section\":{},\"key\":\"{}\",\"chord\":\"{}\",\"peak\":{:.3},\"export\":\"{}\",\"song\":\"{}\",\"song_on\":{},\"notes\":{},\"layers\":{{{}}}}}",
             self.intensity.get(),
             self.st_intensity.get(),
             self.darkness.get(),
@@ -378,6 +391,8 @@ impl Shared {
             self.chord(),
             self.st_peak.get(),
             json_escape(&self.export_msg.lock().map(|s| s.clone()).unwrap_or_default()),
+            json_escape(&self.song_status()),
+            self.st_song_on.load(Relaxed),
             notes,
             layers
         )

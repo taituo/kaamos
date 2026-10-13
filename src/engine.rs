@@ -8,6 +8,8 @@ use crate::fx::*;
 use crate::instruments::*;
 use crate::music::*;
 use crate::params::*;
+use crate::radio::Radio;
+use crate::song::*;
 
 const CTL: u32 = 32; // control-rate block size
 
@@ -22,6 +24,27 @@ const BELL_GAIN: f32 = 0.24;
 const KEYS_GAIN: f32 = 0.2;
 const DRUM_GAIN: f32 = 0.62;
 const MASTER_GAIN: f32 = 1.35;
+const RADIO_GAIN: f32 = 1.0;
+
+/// Where the machine is: free-running, or playing a whole song.
+enum SongState {
+    Free,
+    /// a song was asked for; fading the free music out first
+    Pending(Box<Song>),
+    Playing(Box<SongRun>),
+    /// the song was stopped; fading out before going back to free mode
+    Stopping,
+    /// the song ended; a short silence before free mode fades back in
+    Returning(f32),
+}
+
+struct SongRun {
+    song: Song,
+    idx: usize,
+    entered: bool,
+    elapsed: f32,
+    skip: bool,
+}
 
 pub struct Engine {
     sr: f32,
@@ -94,6 +117,19 @@ pub struct Engine {
     was_locked: bool,
     seed: u64,
     export_pending: bool,
+
+    // song mode
+    song_state: SongState,
+    song_gain: f32,
+    song_export: bool,
+    song_export_pending: Option<(String, u32, [f32; NL], u64)>,
+    sec_fresh: bool,
+    seq_stopped: bool,
+    stop_release: u32,
+    fill_force: Option<u8>,
+    snap_timer: f32,
+    status_timer: u32,
+    radio: Radio,
     ctl: u32,
     peak: f32,
     gate: f32,
@@ -229,6 +265,17 @@ impl Engine {
             was_locked: false,
             seed,
             export_pending: false,
+            song_state: SongState::Free,
+            song_gain: 1.0,
+            song_export: false,
+            song_export_pending: None,
+            sec_fresh: false,
+            seq_stopped: false,
+            stop_release: 0,
+            fill_force: None,
+            snap_timer: 0.0,
+            status_timer: 0,
+            radio: Radio::new(sr),
             ctl: 0,
             peak: 0.0,
             gate: 0.0,
@@ -278,8 +325,295 @@ impl Engine {
         match self.sh.layer_mode[l].load(Relaxed) {
             MODE_ON => 1.0,
             MODE_OFF => 0.0,
-            _ => auto_gain(l, self.inten),
+            _ => match &self.song_state {
+                SongState::Playing(r) => r.song.secs[r.idx].gains[l],
+                _ => auto_gain(l, self.inten),
+            },
         }
+    }
+
+    fn playing(&self) -> bool {
+        matches!(self.song_state, SongState::Playing(_))
+    }
+
+    // ------------------------------------------------------------ songs
+
+    /// Voice clips for the radio intro (resampled to the engine rate here).
+    pub fn set_voices(&mut self, clips: &[crate::wav::Clip]) {
+        let v = clips.iter().map(|c| crate::wav::prepare(c, self.sr)).collect();
+        self.radio.set_voices(v);
+    }
+
+    pub fn voice_secs(&self) -> Vec<f32> {
+        self.radio.voice_secs()
+    }
+
+    /// Start playing a song from its first bar (offline render, or after the live fade).
+    /// With `export`, every section is captured as Strudel code as it starts.
+    pub fn start_song_now(&mut self, song: Song, export: bool) {
+        self.bpm = song.bpm;
+        self.sh.bpm.set(song.bpm);
+        self.step_inc = self.bpm * 4.0 / 60.0 / self.sr;
+        self.song_export = export;
+        self.fader = 1.0; // the song's intro does its own fading in
+        self.want_next = false;
+        self.want_key = false;
+        self.extra_loops = 0;
+        let i0 = song.secs[0].i0;
+        self.sh.intensity.set(i0);
+        self.inten = i0;
+        self.song_state = SongState::Playing(Box::new(SongRun {
+            song,
+            idx: 0,
+            entered: false,
+            elapsed: 0.0,
+            skip: false,
+        }));
+        for l in 0..NL {
+            self.gains[l] = self.layer_target(l);
+        }
+    }
+
+    fn toggle_song(&mut self) {
+        match self.song_state {
+            SongState::Free | SongState::Returning(_) => {
+                let seed = self.rng.next() % 1_000_000;
+                let song = Song::plan(&SongOpts {
+                    seed,
+                    darkness: self.sh.darkness.get(),
+                    bpm: Some(self.sh.bpm.get()),
+                    target_secs: None,
+                    voice_secs: self.radio.voice_secs(),
+                    radio: RadioPref::Auto,
+                    ending: None,
+                });
+                self.song_state = SongState::Pending(Box::new(song));
+            }
+            SongState::Pending(_) => self.song_state = SongState::Free,
+            SongState::Playing(_) | SongState::Stopping => self.song_state = SongState::Stopping,
+        }
+    }
+
+    /// Clear tails so nothing from before comes back when the gain rises again.
+    fn clean_slate(&mut self) {
+        self.pad.release_fast();
+        self.verb.clear();
+        self.gverb.clear();
+        self.echo.clear();
+    }
+
+    /// Called at each bar line: start a pending song once the free music has faded,
+    /// or go back to free mode once a stopped song has faded.
+    fn song_transitions(&mut self) {
+        let silent = self.song_gain < 0.03;
+        match std::mem::replace(&mut self.song_state, SongState::Free) {
+            SongState::Pending(song) if silent => {
+                self.clean_slate();
+                self.drone.jump(song.key - 12);
+                let export = self.song_export;
+                self.start_song_now(*song, export);
+            }
+            SongState::Stopping if silent => self.end_song(false),
+            other => self.song_state = other,
+        }
+    }
+
+    fn end_song(&mut self, finished: bool) {
+        self.seq_stopped = false;
+        self.fill_force = None;
+        self.extra_loops = 0;
+        self.want_next = true;
+        self.sh.intensity.set(0.2);
+        if finished {
+            self.sh.song_done.fetch_add(1, Relaxed);
+            self.song_state = SongState::Returning(2.0);
+        } else {
+            self.clean_slate();
+            self.song_state = SongState::Free;
+        }
+    }
+
+    fn apply_part(&mut self, p: &Part) {
+        self.key = p.key;
+        self.mode = p.mode;
+        self.prog = p.prog.clone();
+        self.bpc = p.bpc.max(1);
+        self.loop_bars = p.loop_bars();
+        self.motif = p.motif.clone();
+        self.bass_pats = p.bass_pats;
+        self.drum_var = p.drum_var;
+        self.keys_pat = p.keys_pat;
+        self.lead_line = p.lead.clone();
+        self.arp_count = 0;
+        self.chord_idx = usize::MAX;
+        self.drone.set_note(self.key - 12);
+        self.sh.st_key.store(self.key.rem_euclid(12) as u32, Relaxed);
+        self.sh.st_mode.store(self.mode as u32, Relaxed);
+    }
+
+    fn enter_section(&mut self, repeat: bool) {
+        let SongState::Playing(run) = &self.song_state else {
+            return;
+        };
+        let sec = run.song.secs[run.idx].clone();
+        let mut part = run.song.parts[sec.part].transposed(sec.transpose);
+        if sec.kind == Kind::End {
+            part.prog = vec![0];
+            part.bpc = 1;
+            part.lead.clear();
+        }
+        self.apply_part(&part);
+        self.sec_bars = sec.bars;
+        if !repeat {
+            self.section += 1;
+            self.sec_fresh = true;
+        }
+        self.sh.st_section.store(self.section, Relaxed);
+        if sec.snap {
+            self.snap_timer = 0.25;
+        }
+        self.sh.intensity.set(sec.i0);
+        self.seq_stopped = false;
+    }
+
+    fn song_bar(&mut self, hold: bool) {
+        let lock = self.sh.lock.load(Relaxed);
+        if self.was_locked && !lock {
+            self.extra_loops = 0;
+        }
+        self.was_locked = lock;
+        let SongState::Playing(run) = &mut self.song_state else {
+            return;
+        };
+        let mut enter: Option<bool> = None;
+        if !run.entered {
+            run.entered = true;
+            run.idx = 0;
+            enter = Some(false);
+        } else if run.skip {
+            run.skip = false;
+            run.idx += 1;
+            enter = Some(false);
+        } else if !hold && self.bar_in_sec >= run.song.secs[run.idx].bars {
+            if lock || self.extra_loops > 0 {
+                if !lock {
+                    self.extra_loops -= 1;
+                }
+                enter = Some(true);
+            } else {
+                run.idx += 1;
+                enter = Some(false);
+            }
+        }
+        if run.idx >= run.song.secs.len() {
+            self.end_song(true);
+            self.free_bar(hold);
+            return;
+        }
+        if let Some(repeat) = enter {
+            self.bar_in_sec = 0;
+            self.enter_section(repeat);
+        }
+        let SongState::Playing(run) = &self.song_state else {
+            return;
+        };
+        let sec = run.song.secs[run.idx].clone();
+        let song_seed = run.song.seed;
+
+        let b = self.bar_in_sec.min(sec.bars.saturating_sub(1));
+        if (sec.i1 - sec.i0).abs() > 1e-4 {
+            let p = b as f32 / (sec.bars.max(2) - 1) as f32;
+            self.sh.intensity.set(sec.i0 + (sec.i1 - sec.i0) * p);
+        }
+        self.drum_level = sec.drums;
+        self.arp_rate = sec.arp_rate.max(1);
+        self.bass_level = sec.bass_level.min(2);
+        self.fill_bar = false;
+        self.fill_forced = false;
+        self.fill_force = None;
+        // a section that is about to repeat skips its build-up (riser, fill)
+        let repeating = lock || self.extra_loops > 0;
+        for (eb, ev) in &sec.events {
+            if *eb == self.bar_in_sec {
+                self.fire_song_event(ev, repeating);
+            }
+        }
+        if self.drum_level == 3 && !self.fill_bar && self.bar_in_sec % 4 == 3 && self.rng.chance(0.25) {
+            self.fill_bar = true;
+            self.fill_kind = self.rng.below(2) as u8;
+        }
+        if !self.seq_stopped {
+            let ci = if hold && self.chord_idx != usize::MAX {
+                self.chord_idx
+            } else {
+                ((self.bar_in_sec / self.bpc) as usize) % self.prog.len()
+            };
+            if ci != self.chord_idx {
+                self.set_chord(ci);
+            }
+        }
+        if self.song_export && self.sec_fresh && self.bar_in_sec == 1.min(sec.bars - 1) && sec.kind != Kind::End {
+            self.sec_fresh = false;
+            self.song_export_pending = Some((sec.name.clone(), sec.bars, sec.gains, song_seed));
+        }
+    }
+
+    fn fire_song_event(&mut self, ev: &Ev, repeating: bool) {
+        match ev {
+            Ev::Radio => {
+                if let SongState::Playing(r) = &self.song_state {
+                    if let Some(c) = r.song.radio.clone() {
+                        self.radio.start(&c);
+                    }
+                }
+            }
+            Ev::Static(secs) => self.radio.start_static(*secs),
+            Ev::Riser(n) if !repeating => {
+                let samples = (*n * 16) as f32 * self.sps() - 2.0;
+                self.imp.riser(samples);
+            }
+            Ev::Fill(k) if !repeating => {
+                self.fill_bar = true;
+                self.fill_forced = true;
+                self.fill_force = Some(*k);
+            }
+            Ev::Boom => {
+                self.imp.boom();
+                self.imp.crash(0.6);
+            }
+            Ev::Crash(v) => self.imp.crash(*v),
+            Ev::Hit => self.final_hit(),
+            _ => {}
+        }
+    }
+
+    /// The last chord: everything hits the tonic together, then the sequencers stop.
+    fn final_hit(&mut self) {
+        let notes = self.pad_notes(0, 1.0);
+        self.pad.release_fast();
+        let vel = 0.62 / (notes.len() as f32).sqrt();
+        for &n in &notes {
+            self.pad.note_on(n, vel, 0.004, 1.8, 1.0);
+        }
+        let gate = (32.0 * self.sps()) as u32;
+        let (low, upper) = self.keys_voicing(0);
+        self.keys.note_on(low, 0.9, gate);
+        for &n in &upper {
+            self.keys.note_on(n, 0.85, gate);
+        }
+        let root = self.bass_root_for(0);
+        self.bass.note_on(root, 1.0, gate);
+        self.kick(1.0);
+        self.imp.boom();
+        self.imp.crash(0.8);
+        self.chord_idx = 0;
+        self.chord_deg = 0;
+        mask_set(&self.sh.st_chord_mask, &notes);
+        if let Ok(mut s) = self.sh.st_chord.try_lock() {
+            *s = chord_name(self.key, self.mode, 0, 3);
+        }
+        self.seq_stopped = true;
+        self.stop_release = 6;
     }
 
     #[inline]
@@ -295,7 +629,7 @@ impl Engine {
         let sh = self.sh.clone();
 
         // drift: let the machine wander between calm and intense on its own
-        if sh.drift.load(Relaxed) {
+        if sh.drift.load(Relaxed) && !self.playing() {
             self.drift_timer -= dt;
             if self.drift_timer <= 0.0 {
                 let (a, b) = (sh.drift_min.get(), sh.drift_max.get());
@@ -307,7 +641,8 @@ impl Engine {
             sh.intensity.set(cur + (self.drift_target - cur) * coef(10.0, rate));
         }
 
-        self.inten += (sh.intensity.get() - self.inten) * coef(2.2, rate);
+        let itau = if self.playing() { 0.5 } else { 2.2 };
+        self.inten += (sh.intensity.get() - self.inten) * coef(itau, rate);
         self.dark += (sh.darkness.get() - self.dark) * coef(1.0, rate);
         self.bpm += (sh.bpm.get() - self.bpm) * coef(1.2, rate);
         self.space += (sh.space.get() - self.space) * coef(0.6, rate);
@@ -330,9 +665,75 @@ impl Engine {
         }
 
         // layer gains
+        let gtau = if !self.playing() {
+            1.3
+        } else if self.snap_timer > 0.0 {
+            0.03
+        } else {
+            0.7
+        };
+        self.snap_timer -= dt;
         for l in 0..NL {
             let target = self.layer_target(l);
-            self.gains[l] += (target - self.gains[l]) * coef(1.3, rate);
+            self.gains[l] += (target - self.gains[l]) * coef(gtau, rate);
+        }
+
+        // song gain: dips between free mode and songs, and the song's own fade-outs
+        let pos_in_bar = (self.step % 16) as f32 / 16.0;
+        let bar_in_sec = self.bar_in_sec;
+        let (sg_target, sg_tau) = match &mut self.song_state {
+            SongState::Free => (1.0, 2.5),
+            SongState::Pending(_) | SongState::Stopping => (0.0, 0.35),
+            SongState::Returning(t) => {
+                *t -= dt;
+                (0.0, 0.35)
+            }
+            SongState::Playing(r) => {
+                r.elapsed += dt;
+                let s = &r.song.secs[r.idx];
+                match s.fade_from {
+                    Some(fb) if r.entered => {
+                        let span = s.bars.saturating_sub(fb).max(1) as f32;
+                        let p = ((bar_in_sec as f32 - fb as f32 + pos_in_bar) / span).clamp(0.0, 1.0);
+                        ((1.0 - p) * (1.0 - p), 0.05)
+                    }
+                    _ => (1.0, 0.3),
+                }
+            }
+        };
+        self.song_gain += (sg_target - self.song_gain) * coef(sg_tau, rate);
+        if let SongState::Returning(t) = self.song_state {
+            if t <= 0.0 {
+                self.song_state = SongState::Free;
+            }
+        }
+        self.status_timer += 1;
+        if self.status_timer as f32 >= rate * 0.25 {
+            self.status_timer = 0;
+            let (on, text) = match &self.song_state {
+                SongState::Free => (false, String::new()),
+                SongState::Pending(_) => (true, "starting".to_string()),
+                SongState::Stopping => (true, "stopping".to_string()),
+                SongState::Returning(_) => (false, "song over".to_string()),
+                SongState::Playing(r) => {
+                    let s = &r.song.secs[r.idx];
+                    (
+                        true,
+                        format!(
+                            "{} · bar {}/{} · {} / {}",
+                            s.name,
+                            (self.bar_in_sec + 1).min(s.bars),
+                            s.bars,
+                            mmss(r.elapsed),
+                            mmss(r.song.total_secs())
+                        ),
+                    )
+                }
+            };
+            sh.st_song_on.store(on, Relaxed);
+            if let Ok(mut st) = sh.st_song.try_lock() {
+                *st = text;
+            }
         }
         let fill_target = if self.fill_forced { 0.85 } else { 0.0 };
         self.fill_gain += (fill_target - self.fill_gain) * coef(if self.fill_forced { 0.02 } else { 1.5 }, rate);
@@ -396,7 +797,19 @@ impl Engine {
                 self.export_pending = false;
             }
         }
-        let left = self.sec_bars.saturating_sub(self.bar_in_sec) + self.extra_loops * self.loop_bars;
+        if let Some((label, bars, gains, seed)) = self.song_export_pending.take() {
+            match sh.captures.try_lock() {
+                Ok(mut caps) => {
+                    let mut snap = self.snapshot_with(Some(gains));
+                    snap.song = Some((label, bars));
+                    snap.seed = seed;
+                    caps.push(snap);
+                }
+                Err(_) => self.song_export_pending = Some((label, bars, gains, seed)),
+            }
+        }
+        let per = if self.playing() { self.sec_bars } else { self.loop_bars };
+        let left = self.sec_bars.saturating_sub(self.bar_in_sec) + self.extra_loops * per;
         sh.st_bars_left.store(left, Relaxed);
         sh.st_loops.store(self.extra_loops, Relaxed);
         sh.st_loop_bars.store(self.loop_bars, Relaxed);
@@ -472,12 +885,17 @@ impl Engine {
                 self.imp.riser(samples);
             }
             T_NEXT => {
-                self.want_next = true;
+                if let SongState::Playing(r) = &mut self.song_state {
+                    r.skip = true;
+                } else {
+                    self.want_next = true;
+                }
                 self.extra_loops = 0;
             }
+            T_SONG => self.toggle_song(),
             T_LOOP => self.extra_loops = (self.extra_loops + 1).min(99),
             T_EXPORT => self.export_pending = true,
-            T_KEY => {
+            T_KEY if !self.playing() => {
                 self.want_key = true;
                 self.want_next = true;
             }
@@ -611,6 +1029,10 @@ impl Engine {
 
     /// One pass of the current chord loop, exactly as the engine plays it, for export.
     fn snapshot(&self) -> crate::strudel::Snapshot {
+        self.snapshot_with(None)
+    }
+
+    fn snapshot_with(&self, gains: Option<[f32; NL]>) -> crate::strudel::Snapshot {
         let i = self.inten;
         let bars = self.loop_bars.max(1);
         let bpc = self.bpc.max(1);
@@ -682,6 +1104,7 @@ impl Engine {
         }
         let ext = chord_ext(i);
         crate::strudel::Snapshot {
+            song: None,
             keys,
             seed: self.seed,
             section: self.section,
@@ -707,7 +1130,7 @@ impl Engine {
             bells,
             drum_level: self.drum_level,
             drum_var: self.drum_var,
-            gains: self.gains,
+            gains: gains.unwrap_or(self.gains),
             pad_cut: self.c_pad_cut,
             arp_cut: self.c_arp_cut,
             bass_cut: self.c_bass_cut,
@@ -725,6 +1148,16 @@ impl Engine {
         } else {
             self.started = true;
         }
+        self.song_transitions();
+        if self.playing() {
+            self.song_bar(hold);
+        } else {
+            self.free_bar(hold);
+        }
+        self.sh.st_bar.store(self.bar, Relaxed);
+    }
+
+    fn free_bar(&mut self, hold: bool) {
         let i = self.inten;
 
         // drum / arp / bass levels with hysteresis
@@ -821,13 +1254,23 @@ impl Engine {
         if ci != self.chord_idx {
             self.set_chord(ci);
         }
-        self.sh.st_bar.store(self.bar, Relaxed);
     }
 
     fn on_step(&mut self) {
         let sib = (self.step % 16) as u32;
         if sib == 0 {
             self.on_bar();
+        }
+        if self.seq_stopped {
+            // after the final hit: just let things ring
+            if self.stop_release > 0 {
+                self.stop_release -= 1;
+                if self.stop_release == 0 {
+                    self.pad.release_all();
+                }
+            }
+            self.step += 1;
+            return;
         }
         let sps = self.sps();
         let i = self.inten;
@@ -1034,7 +1477,11 @@ impl Engine {
 
         if self.fill_bar && s >= 8 {
             let toms = [195.0, 165.0, 140.0, 122.0, 106.0, 92.0];
-            let kind = if lv <= 1 || !normal { 0 } else { self.fill_kind };
+            let kind = match self.fill_force {
+                Some(k) => k,
+                None if lv <= 1 || !normal => 0,
+                None => self.fill_kind,
+            };
             match kind {
                 0 => {
                     let slots = if lv <= 1 || !normal {
@@ -1120,6 +1567,8 @@ impl Engine {
         let (kl, kr, gsend) = self.drums.process();
         let (kl, kr, gsend) = (kl * dg, kr * dg, gsend * dg);
         let (il, ir, isend) = self.imp.process();
+        let (ral, rar, rsend) = self.radio.process();
+        let (il, ir, isend) = (il + ral * RADIO_GAIN, ir + rar * RADIO_GAIN, isend + rsend * RADIO_GAIN);
 
         // pad through the ensemble chorus
         let (cl, cr) = self.chorus.process(pad, 1.0);
@@ -1176,7 +1625,7 @@ impl Engine {
         let (l, r) = self.tape.process(l, r, self.tape_amt);
         self.peak = self.peak.max(l.abs().max(r.abs()));
         let (l, r) = self.lim.process(l, r);
-        let m = self.vol * self.vol * self.fader * self.fader * self.fader;
+        let m = self.vol * self.vol * self.fader * self.fader * self.fader * self.song_gain;
         let l = self.dc[0].process(l * m);
         let r = self.dc[1].process(r * m);
         (l, r)
@@ -1194,6 +1643,62 @@ mod tests {
         for _ in 0..n {
             e.next();
         }
+    }
+
+    #[test]
+    fn a_live_song_plays_through_and_returns_to_free_mode() {
+        let sh = Arc::new(Shared::new());
+        sh.set_param("intensity", 0.7);
+        let mut e = Engine::new(SR, sh.clone(), 11);
+        run_bars(&mut e, 2.0);
+        assert!(!sh.st_song_on.load(Relaxed));
+        sh.fire("song");
+        run_bars(&mut e, 0.3);
+        assert!(sh.st_song_on.load(Relaxed), "song requested");
+        // fades out, then starts at a bar line within a couple of bars
+        run_bars(&mut e, 3.0);
+        assert!(e.playing(), "song playing");
+        let SongState::Playing(r) = &e.song_state else {
+            unreachable!()
+        };
+        let total_bars = r.song.total_bars();
+        let n_secs = r.song.secs.len();
+        // skip one part with "next"
+        let idx0 = r.idx;
+        sh.fire("next");
+        run_bars(&mut e, 1.2);
+        let SongState::Playing(r) = &e.song_state else {
+            unreachable!()
+        };
+        assert_eq!(r.idx, idx0 + 1, "next skips to the following part");
+        // play to the end
+        let done0 = sh.song_done.load(Relaxed);
+        let mut bars = 0.0;
+        while sh.song_done.load(Relaxed) == done0 {
+            run_bars(&mut e, 1.0);
+            bars += 1.0;
+            assert!(bars < total_bars as f32 + 4.0, "song never ended ({n_secs} parts)");
+        }
+        // after a short pause free mode comes back and the music fades in again
+        run_bars(&mut e, 3.0);
+        assert!(matches!(e.song_state, SongState::Free));
+        run_bars(&mut e, 4.0);
+        assert!(e.song_gain > 0.8, "free mode fades back in ({})", e.song_gain);
+        assert!(!sh.st_song_on.load(Relaxed));
+    }
+
+    #[test]
+    fn stopping_a_song_returns_to_free_mode() {
+        let sh = Arc::new(Shared::new());
+        let mut e = Engine::new(SR, sh.clone(), 5);
+        sh.fire("song");
+        run_bars(&mut e, 6.0);
+        assert!(e.playing());
+        sh.fire("song");
+        run_bars(&mut e, 3.0);
+        assert!(matches!(e.song_state, SongState::Free));
+        run_bars(&mut e, 6.0);
+        assert!(e.song_gain > 0.8);
     }
 
     #[test]

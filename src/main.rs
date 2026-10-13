@@ -7,9 +7,12 @@ mod fx;
 mod instruments;
 mod music;
 mod params;
+mod radio;
 mod render;
+mod song;
 mod strudel;
 mod tui;
+mod wav;
 mod web;
 
 #[cfg(feature = "audio")]
@@ -43,7 +46,21 @@ LIVE (default)
   --rate N        sample rate for --stdout / render (default 48000)
   --export-dir D  where pattern captures (key c) are written (default: current folder)
 
-RENDER
+  --song          start straight into a whole song (key m / SONG button does the same)
+  --voice F.wav   a voice clip for song radio intros (repeat for a dialogue)
+
+SONG (a whole track: intro, verses, chorus, B-section, climax, ending)
+  kaamos song [out.wav] [options]
+  --seed N                    which song (same seed = same song)
+  --minutes N | --seconds N   rough length (default: 2:20 to 3:40, picked by the seed)
+  --bpm N  --darkness X       tempo and mood (default: picked by the seed / 0.62)
+  --voice a.wav --voice b.wav radio dialogue in the intro (WAV, any rate)
+  --radio auto|on|off         radio intro (auto: when there are voices, else sometimes)
+  --ending fade|stop|bookend  how it ends (default: picked by the seed)
+  --strudel                   also write every section as Strudel code
+  --events \"1m30:boom, 2m:lead=off\"   extra events on top of the song
+
+RENDER (free-running, scripted)
   kaamos render [out.wav] [options]
   --seconds N | --minutes N     length (default 180 s)
   --curve \"0:0.1, 60:0.5, 2m:1, 3m:0.2\"   intensity automation (time:value)
@@ -52,7 +69,7 @@ RENDER
   (all live options like --seed --darkness --bpm also work)
 
 EVENT / WEB COMMANDS
-  triggers: boom fill riser next key loop export
+  triggers: boom fill riser next key loop export song
   toggles:  drift hold lock fade (or lock=on)
   layers:   drone pad arp bass drums lead bells  =auto|on|off|cycle
   params:   intensity darkness bpm space tape volume drift_min drift_max =value
@@ -73,6 +90,11 @@ pub struct Opts {
     pub events: Option<String>,
     pub no_fade: bool,
     pub export_dir: String,
+    pub voices: Vec<String>,
+    pub radio: song::RadioPref,
+    pub ending: Option<song::Ending>,
+    pub strudel: bool,
+    pub song_now: bool,
 }
 
 impl Opts {
@@ -92,6 +114,11 @@ impl Opts {
             events: None,
             no_fade: false,
             export_dir: ".".into(),
+            voices: Vec::new(),
+            radio: song::RadioPref::Auto,
+            ending: None,
+            strudel: false,
+            song_now: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -129,12 +156,34 @@ impl Opts {
                 "--events" => o.events = Some(val(flag)?),
                 "--no-fade" => o.no_fade = true,
                 "--export-dir" => o.export_dir = val(flag)?,
+                "--voice" => o.voices.push(val(flag)?),
+                "--radio" => {
+                    o.radio = match val(flag)?.as_str() {
+                        "auto" => song::RadioPref::Auto,
+                        "on" | "yes" => song::RadioPref::On,
+                        "off" | "no" => song::RadioPref::Off,
+                        v => return Err(format!("--radio: '{v}' (want auto, on or off)")),
+                    }
+                }
+                "--ending" => {
+                    let v = val(flag)?;
+                    o.ending =
+                        Some(song::Ending::parse(&v).ok_or(format!("--ending: '{v}' (want fade, stop or bookend)"))?);
+                }
+                "--strudel" => o.strudel = true,
+                "--song" => o.song_now = true,
                 _ if render && !a.starts_with("--") && o.output.is_none() => o.output = Some(a.to_string()),
                 _ => return Err(format!("unknown option '{a}' (try: kaamos help)")),
             }
             i += 1;
         }
         Ok(o)
+    }
+
+    /// Load the --voice clips (fails early with a clear message).
+    pub fn load_voices(&self) -> Result<Arc<Vec<wav::Clip>>, String> {
+        let clips: Result<Vec<_>, _> = self.voices.iter().map(|p| wav::read(p)).collect();
+        Ok(Arc::new(clips?))
     }
 
     pub fn apply(&self, sh: &Shared) {
@@ -166,6 +215,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let res = match args.first().map(String::as_str) {
         Some("render") => Opts::parse(&args[1..], true).and_then(|o| render::run(&o)),
+        Some("song") => Opts::parse(&args[1..], true).and_then(|o| render::song(&o)),
         Some("help") | Some("-h") | Some("--help") => {
             print!("{USAGE}");
             Ok(())
@@ -181,6 +231,7 @@ fn main() {
 fn live(o: &Opts) -> Result<(), String> {
     let sh = Arc::new(Shared::new());
     o.apply(&sh);
+    let clips = o.load_voices()?;
 
     // keep the audio stream alive for the whole session
     let mut _keep: Vec<Box<dyn std::any::Any>> = Vec::new();
@@ -189,8 +240,10 @@ fn live(o: &Opts) -> Result<(), String> {
         let rate = o.rate.unwrap_or(48000);
         let sh2 = sh.clone();
         let seed = o.seed;
+        let clips = clips.clone();
         std::thread::spawn(move || {
             let mut eng = engine::Engine::new(rate as f32, sh2.clone(), seed);
+            eng.set_voices(&clips);
             let out = std::io::stdout();
             let mut lock = out.lock();
             let mut buf = vec![0u8; 2048 * 4];
@@ -213,7 +266,7 @@ fn live(o: &Opts) -> Result<(), String> {
     } else {
         #[cfg(feature = "audio")]
         {
-            let (stream, rate, name) = audio::start(sh.clone(), o.seed)?;
+            let (stream, rate, name) = audio::start(sh.clone(), o.seed, clips.clone())?;
             _keep.push(Box::new(stream));
             (name, rate)
         }
@@ -226,6 +279,15 @@ fn live(o: &Opts) -> Result<(), String> {
             );
         }
     };
+
+    if o.song_now {
+        // the engine starts on its own thread: ask for the song once it is running
+        let sh = sh.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            sh.fire("song");
+        });
+    }
 
     // pattern captures -> Strudel files (written off the audio thread)
     {

@@ -12,6 +12,8 @@ use crate::params::{Shared, LAYERS, NL};
 /// Built by the engine at capture time; all notes are MIDI numbers.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
+    /// set for song captures: (section label, bars it plays in the song)
+    pub song: Option<(String, u32)>,
     pub seed: u64,
     pub section: u32,
     pub key_name: String,
@@ -377,6 +379,10 @@ impl Exporter {
         self.dir.join(format!("kaamos-{seed}.strudel.js"))
     }
 
+    pub fn song_path_for(&self, seed: u64) -> PathBuf {
+        self.dir.join(format!("kaamos-song-{seed}.strudel.js"))
+    }
+
     /// Write any pending captures. Returns a short status message if something happened.
     pub fn flush(&mut self, sh: &Shared) -> Option<String> {
         let caps: Vec<Snapshot> = match sh.captures.lock() {
@@ -399,17 +405,39 @@ impl Exporter {
 
     fn append(&mut self, cap: &Snapshot) -> std::io::Result<String> {
         let body = pattern_code(cap, "PAT");
-        if self.last_body.as_ref() == Some(&(cap.seed, body.clone())) {
+        if cap.song.is_none() && self.last_body.as_ref() == Some(&(cap.seed, body.clone())) {
             return Ok("same pattern already captured".into());
         }
-        let path = self.path_for(cap.seed);
+        let path = if cap.song.is_some() {
+            self.song_path_for(cap.seed)
+        } else {
+            self.path_for(cap.seed)
+        };
         let existing = fs::read_to_string(&path).ok();
         let (head, mut song) = match &existing {
             Some(text) => split_song(text),
             None => (header(cap), Vec::new()),
         };
-        let name = format!("p{}", song.len() + 1);
-        let bars = (16 / cap.loop_bars.max(1)).max(1) * cap.loop_bars.max(1);
+        let (name, bars) = match &cap.song {
+            Some((label, bars)) => {
+                // a JS-safe, unique name from the section label ("chorus 2" -> chorus2)
+                let mut n: String = label.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                if n.is_empty() || n.starts_with(|c: char| c.is_ascii_digit()) {
+                    n.insert(0, 's');
+                }
+                let base = n.clone();
+                let mut k = 2;
+                while song.iter().any(|(x, _)| *x == n) {
+                    n = format!("{base}_{k}");
+                    k += 1;
+                }
+                (n, *bars)
+            }
+            None => (
+                format!("p{}", song.len() + 1),
+                (16 / cap.loop_bars.max(1)).max(1) * cap.loop_bars.max(1),
+            ),
+        };
         song.push((name.clone(), bars));
         let code = pattern_code(cap, &name);
         let mut out = head.trim_end().to_string();
@@ -437,6 +465,15 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 fn header(cap: &Snapshot) -> String {
+    if cap.song.is_some() {
+        return format!(
+            "// KAAMOS song · seed {}\n\
+             // Paste into https://strudel.cc and press Ctrl+Enter (Cmd+Enter on a Mac).\n\
+             // One pattern per section; arrange() at the end plays the whole song.\n\
+             setcps({:.0}/60/4)\n",
+            cap.seed, cap.bpm
+        );
+    }
     format!(
         "// KAAMOS patterns · seed {}\n\
          // Paste into https://strudel.cc and press Ctrl+Enter (Cmd+Enter on a Mac).\n\
@@ -477,6 +514,7 @@ mod tests {
 
     fn snap(seed: u64) -> Snapshot {
         Snapshot {
+            song: None,
             seed,
             section: 2,
             key_name: "A aeolian".into(),

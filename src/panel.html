@@ -88,6 +88,8 @@ button:active{transform:scale(.96)}
 .pattern{margin:12px 2px 0;font-size:12px;color:var(--mute);letter-spacing:.08em;text-align:center}
 .pattern b{color:var(--cyan);font-weight:600}
 .pattern.locked b{color:var(--red)}
+.pad.song{grid-column:span 2;min-height:58px;color:var(--cyan);border-color:rgba(89,225,255,.35);text-shadow:0 0 10px rgba(89,225,255,.6)}
+.pad.song.on{background:rgba(89,225,255,.12);box-shadow:0 0 18px rgba(89,225,255,.35) inset}
 .pattern.export{margin-top:4px;color:var(--cyan);font-size:11px;min-height:14px;word-break:break-all}
 .pad{min-height:64px;font-size:14px;letter-spacing:.25em;font-weight:700}
 .pad.big{grid-column:span 2;min-height:84px;font-size:22px;letter-spacing:.5em;color:var(--red);border-color:var(--red2);
@@ -169,6 +171,7 @@ footer{text-align:center;color:var(--mute);font-size:10px;letter-spacing:.3em;ma
       <button class="pad" data-cmd="key">NEW KEY</button>
       <button class="pad" data-cmd="loop">REPEAT <span id="loops" class="badge"></span></button>
       <button class="pad" data-cmd="export">CAPTURE</button>
+      <button class="pad song" data-cmd="song" id="songbtn">PLAY A SONG</button>
     </div>
     <div class="pattern" id="pattern">pattern</div>
     <div class="pattern export" id="export"></div>
@@ -383,7 +386,11 @@ function render(s){
   $("#export").textContent = s.export || "";
   const p = $("#pattern");
   p.classList.toggle("locked", !!s.lock);
-  p.innerHTML = s.hold ? "chord <b>held</b>"
+  const sb = $("#songbtn");
+  sb.textContent = s.song_on ? "STOP SONG" : "PLAY A SONG";
+  sb.classList.toggle("on", !!s.song_on);
+  if (s.song_on || s.song) { p.innerHTML = `song · <b>${s.song}</b>` + (s.lock ? " · <b>locked</b>" : ""); }
+  else p.innerHTML = s.hold ? "chord <b>held</b>"
     : s.lock ? `${s.loop_bars}-bar pattern <b>locked</b>`
     : `${s.loop_bars}-bar pattern · changes in <b>${s.bars_left}</b> bars`;
   document.querySelectorAll("#presets button").forEach((b) => {

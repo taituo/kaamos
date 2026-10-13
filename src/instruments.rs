@@ -108,6 +108,17 @@ impl Pad {
         }
     }
 
+    /// Let every voice go within ~60 ms (clears the way for a final hit or a new song).
+    pub fn release_fast(&mut self) {
+        let sr = self.sr;
+        for v in self.v.iter_mut() {
+            if v.env.active() {
+                v.env.set_release(0.06, sr);
+                v.env.gate_off();
+            }
+        }
+    }
+
     #[inline]
     pub fn process(&mut self, cutoff: f32, reso: f32, shimmer: f32) -> f32 {
         let sr = self.sr;
@@ -344,6 +355,11 @@ impl Drone {
     }
     pub fn set_note(&mut self, n: i32) {
         self.target = n as f32;
+    }
+    /// Move to a note immediately (no glide).
+    pub fn jump(&mut self, n: i32) {
+        self.target = n as f32;
+        self.note = n as f32;
     }
     #[inline]
     pub fn process(&mut self, bright: f32, air_amt: f32) -> (f32, f32, f32) {

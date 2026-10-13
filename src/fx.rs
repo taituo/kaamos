@@ -54,6 +54,11 @@ pub struct Echo {
 }
 
 impl Echo {
+    pub fn clear(&mut self) {
+        self.l.clear();
+        self.r.clear();
+    }
+
     pub fn new(sr: f32) -> Self {
         Echo {
             l: DelayLine::new((sr * 2.1) as usize),
@@ -103,6 +108,13 @@ pub struct Reverb {
 const FDN_MS: [f32; 8] = [43.7, 51.3, 59.9, 67.1, 73.3, 83.9, 91.7, 101.9];
 
 impl Reverb {
+    pub fn clear(&mut self) {
+        for l in self.lines.iter_mut() {
+            l.clear();
+        }
+        self.pre.clear();
+    }
+
     pub fn new(sr: f32, size: f32, pre_ms: f32, damp_hz: f32) -> Self {
         let mut lens = [0.0; 8];
         let mut lines = Vec::new();

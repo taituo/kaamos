@@ -61,6 +61,7 @@ It starts quietly at intensity 0.3, fades in, and prints a link like
 | `l` | repeat the current pattern one more round (press 3× = 3 extra rounds) |
 | `L` | lock the pattern: it repeats until you press `L` again (`n` still jumps on) |
 | `c` | capture the current pattern as Strudel code |
+| `m` | play a whole song (the free music fades out, the song starts on a bar line); `m` again stops it |
 | `h` | hold: freeze on the current chord |
 | `z` | drift: the machine wanders between calm and intense by itself |
 | `x` | fade out (10 s) / fade back in |
@@ -72,6 +73,68 @@ the intensity up for a build.
 
 The phone panel has the same controls plus big preset buttons
 (DORMANT · EERIE · PULSE · DRIVE · PEAK), REPEAT, LOCK, CAPTURE and the drift range.
+
+## Whole songs
+
+The same generator can also write a complete track, 2 to 4 minutes long:
+
+```sh
+kaamos song                     # a new song, saved as kaamos-song-<seed>.wav
+kaamos song --seed 8 --strudel  # the same song every time, plus Strudel code for it
+```
+
+It prints the plan before rendering:
+
+```
+KAAMOS song · seed 8 · E dorian · 96 bpm · 3:30 · back-to-the-intro ending
+   0:00  intro           8 bars  Em G A D               radio: interval signal (6 notes of the chorus hook)
+   0:20  verse 1         8 bars  Em D A Em              opens with the lead
+   0:40  pre-chorus      4 bars  F#m D                  2-bar riser
+   0:50  chorus 1        8 bars  Em G A D
+   1:10  verse 2         8 bars  Em D A Em
+   1:30  pre-chorus 2    4 bars  F#m D                  2-bar riser
+   1:40  chorus 2        8 bars  Em G A D
+   2:00  B-section       8 bars  G A                    radio static
+   2:20  build           4 bars  G A                    4-bar riser
+   2:30  climax         16 bars  Em G A D               BOOM
+   3:10  outro           8 bars  Em G A D               radio static, fade out
+```
+
+- **Intro**: pad and drone, or an arpeggio on its own. Sometimes a **radio** comes in:
+  static and a tuning whistle, then morse code, a numbers-station interval signal that
+  plays the start of the chorus melody, or your own voice clips.
+- **Verse** opens with the **bass** (with a heartbeat kick) or with the **lead**, and the
+  rest of the band joins.
+- **Pre-chorus**: two chords that want to go somewhere, a riser and a snare build.
+- **Chorus**: its own progression (usually starting away from the home chord) and a
+  hook written to be remembered: higher, rhythmic, repeating. It is the same every time
+  it comes back.
+- **B-section**: a breakdown on new chords with keys and bells, then a four-bar build.
+- **Climax**: the chorus again with BOOM, four-on-the-floor drums and often a key change
+  up a step or a half step.
+- **Ending**: a fade-out, a hard stop on the home chord, or a return to the intro mood.
+
+The seed picks the key, mode, tempo, form, opening and ending. `--minutes 2.5`,
+`--bpm`, `--darkness`, `--ending fade|stop|bookend` and `--radio on|off` steer it.
+Measured in LUFS, the sections follow the shape you'd expect: verse below chorus,
+the B-section drops about 3-4 dB, the climax is the loudest part.
+
+### Radio voices
+
+Any WAV clips (any sample rate, mono or stereo) become a crackly radio dialogue in the
+intro. They alternate between two radio colours, so two clips sound like two people:
+
+```sh
+kaamos song --voice base.wav --voice pilot.wav
+kaamos --voice base.wav --voice pilot.wav     # live: used when you press m
+```
+
+### Songs live
+
+Press `m` (or PLAY A SONG on the phone) and the machine plays a whole song, then fades
+back into free mode. During the song, `n` skips to the next part, `L` holds the current
+part until you release it, `l` repeats it once more, and the intensity knob still works
+inside a part. `--song` starts the session straight into a song.
 
 ## Play along
 
@@ -101,6 +164,10 @@ Press `c` (or CAPTURE on the phone) and the pattern that is playing is written a
 `kaamos-<seed>.strudel.js` in the current folder (`--export-dir` to change it):
 pad chords, arpeggio, bass line, melody, keys, drums, drone and bells, with the filter and
 reverb settings of that moment.
+
+A song rendered with `--strudel` is written to `kaamos-song-<seed>.strudel.js`: one
+pattern per section (`intro`, `verse1`, `chorus1`, … `climax`) and an `arrange()` that
+plays the whole song with the right bar counts.
 
 Every capture with the same seed is **appended** to the same file as `p1`, `p2`, `p3` …,
 and the `arrange(...)` line at the end plays them in order as a song. A new seed starts a
@@ -156,7 +223,10 @@ Handy for triggering from Keynote/OBS scripts or a Stream Deck.
   next-note model
 - `engine.rs`: the clock, the composer (sections, key changes, fills, repeats) and the mix;
   intensity drives layer gains, filter openness, arp rate, drum patterns and sidechain pump
-- `strudel.rs`: pattern capture to Strudel code
+- `song.rs`: the song planner (parts, form, arrangement, endings)
+- `radio.rs`: the radio intro (static, tuning, morse, interval signal, voice clips)
+- `wav.rs`: reading WAV voice clips
+- `strudel.rs`: pattern and song capture to Strudel code
 
 The only dependency is [cpal](https://github.com/RustAudio/cpal) for sound-card output.
 Everything else (DSP, terminal UI, web server) is plain `std`.

@@ -216,6 +216,15 @@ pub fn run(sh: &Arc<Shared>, info: &LiveInfo) -> Result<(), String> {
                     sh.fire("export");
                     Some("capturing pattern for Strudel...")
                 }
+                Key::Char(b'm') => {
+                    let on = sh.st_song_on.load(Relaxed);
+                    sh.fire("song");
+                    Some(if on {
+                        "stopping the song"
+                    } else {
+                        "a new song starts after a short fade"
+                    })
+                }
                 Key::Char(b'L') => {
                     sh.toggle("lock");
                     Some(if sh.lock.load(Relaxed) {
@@ -326,10 +335,24 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
     } else {
         format!("{DIM}changes in {left} bars{RST}")
     };
-    line(format!(
-        "  {TXT}PATTERN{RST} {CYAN}{} bars{RST}   {status}",
-        sh.st_loop_bars.load(Relaxed)
-    ));
+    let song = sh.song_status();
+    if sh.st_song_on.load(Relaxed) || !song.is_empty() {
+        let extra = if sh.lock.load(Relaxed) {
+            format!("{HOT}LOCKED{RST} ")
+        } else if loops > 0 {
+            format!("{HOT}+{loops} repeats{RST} ")
+        } else {
+            String::new()
+        };
+        line(format!(
+            "  {TXT}SONG{RST}    {HOT}{song}{RST}  {extra}{DIM}m stop · n next part · L/l repeat part{RST}"
+        ));
+    } else {
+        line(format!(
+            "  {TXT}PATTERN{RST} {CYAN}{} bars{RST}   {status}",
+            sh.st_loop_bars.load(Relaxed)
+        ));
+    }
     let export = sh.export_msg.lock().map(|s| s.clone()).unwrap_or_default();
     if export.is_empty() {
         line(format!(
@@ -372,7 +395,7 @@ fn draw(sh: &Shared, info: &LiveInfo, flash: Option<&str>) -> String {
         "  {DIM}↑↓ intensity · 1-9 jump · ←→ darkness · , . tempo · [ ] space · o p tape · - = volume{RST}"
     ));
     line(format!(
-        "  {DIM}q w e r t y u i layers · l repeat +1 · L lock pattern · h hold chord · c capture{RST}"
+        "  {DIM}q w e r t y u i layers · l repeat +1 · L lock · h hold chord · c capture · m play a song{RST}"
     ));
     line(format!(
         "  {DIM}SPACE boom · g riser · f fill · n next · k new key · z drift · x fade · Esc quit{RST}"

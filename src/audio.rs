@@ -8,7 +8,11 @@ use cpal::Sample;
 use crate::engine::Engine;
 use crate::params::Shared;
 
-pub fn start(sh: Arc<Shared>, seed: u64) -> Result<(cpal::Stream, u32, String), String> {
+pub fn start(
+    sh: Arc<Shared>,
+    seed: u64,
+    clips: Arc<Vec<crate::wav::Clip>>,
+) -> Result<(cpal::Stream, u32, String), String> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -23,10 +27,10 @@ pub fn start(sh: Arc<Shared>, seed: u64) -> Result<(cpal::Stream, u32, String), 
     let channels = config.channels as usize;
 
     let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, rate, sh, seed),
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, rate, sh, seed),
-        cpal::SampleFormat::I32 => build::<i32>(&device, config, channels, rate, sh, seed),
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, rate, sh, seed),
+        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, rate, sh, seed, &clips),
+        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, rate, sh, seed, &clips),
+        cpal::SampleFormat::I32 => build::<i32>(&device, config, channels, rate, sh, seed, &clips),
+        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, rate, sh, seed, &clips),
         other => Err(format!("unsupported sample format {other:?}")),
     }?;
     stream.play().map_err(|e| format!("cannot start audio: {e}"))?;
@@ -40,11 +44,13 @@ fn build<T>(
     rate: u32,
     sh: Arc<Shared>,
     seed: u64,
+    clips: &[crate::wav::Clip],
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     let mut engine = Engine::new(rate as f32, sh, seed);
+    engine.set_voices(clips);
     let ch = channels.max(1);
     device
         .build_output_stream(

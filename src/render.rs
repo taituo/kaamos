@@ -215,6 +215,95 @@ pub fn run(opts: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// Render a whole song (intro to ending) to WAV, printing its plan.
+pub fn song(opts: &Opts) -> Result<(), String> {
+    use crate::song::{Song, SongOpts};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let rate = opts.rate.unwrap_or(48000);
+    let sh = Arc::new(Shared::new());
+    opts.apply(&sh);
+    let clips = opts.load_voices()?;
+    let mut eng = Engine::new(rate as f32, sh.clone(), opts.seed);
+    eng.set_voices(&clips);
+    let bpm = opts.params.iter().find(|(k, _)| k == "bpm").map(|x| x.1);
+    let song = Song::plan(&SongOpts {
+        seed: opts.seed,
+        darkness: sh.darkness.get(),
+        bpm,
+        target_secs: opts.seconds,
+        voice_secs: eng.voice_secs(),
+        radio: opts.radio,
+        ending: opts.ending,
+    });
+    eprint!("{}", song.describe(clips.len()));
+    let path = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| format!("kaamos-song-{}.wav", opts.seed));
+    let total = song.total_secs();
+    eng.start_song_now(song, opts.strudel);
+
+    let events = match &opts.events {
+        Some(e) => parse_events(e)?,
+        None => Vec::new(),
+    };
+    for (_, c) in &events {
+        if !Shared::new().command(c) {
+            return Err(format!("unknown event command '{c}'"));
+        }
+    }
+    let mut ev = 0usize;
+    let mut ex = crate::strudel::Exporter::new(&opts.export_dir);
+    let mut wav = WavWriter::create(&path, rate).map_err(|e| format!("cannot write {path}: {e}"))?;
+    let done0 = sh.song_done.load(Relaxed);
+    let limit = ((total + 60.0) * rate as f32) as u64;
+    let (mut peak, mut sumsq, mut n) = (0.0f32, 0.0f64, 0u64);
+    let mut last_status = String::new();
+    loop {
+        if n % 64 == 0 {
+            let t = n as f32 / rate as f32;
+            while ev < events.len() && events[ev].0 <= t {
+                sh.command(&events[ev].1);
+                ev += 1;
+            }
+        }
+        let (l, r) = eng.next();
+        peak = peak.max(l.abs()).max(r.abs());
+        sumsq += (l as f64 * l as f64 + r as f64 * r as f64) * 0.5;
+        wav.push(l, r).map_err(|e| e.to_string())?;
+        n += 1;
+        if n % 1024 == 0 {
+            if sh.song_done.load(Relaxed) != done0 || n > limit {
+                break;
+            }
+            let st = sh.song_status();
+            let name = st.split(" · ").next().unwrap_or("").to_string();
+            if name != last_status.split(" · ").next().unwrap_or("") && !name.is_empty() {
+                eprintln!("  rendering {st}");
+            }
+            last_status = st;
+        }
+        if n % rate as u64 == 0 {
+            if let Some(m) = ex.flush(&sh) {
+                eprintln!("  {m}");
+            }
+        }
+    }
+    wav.finish().map_err(|e| e.to_string())?;
+    if let Some(m) = ex.flush(&sh) {
+        eprintln!("  {m}");
+    }
+    let rms = (sumsq / n.max(1) as f64).sqrt() as f32;
+    eprintln!(
+        "kaamos: {path} · {} · peak {:.1} dBFS, rms {:.1} dBFS",
+        crate::song::mmss(n as f32 / rate as f32),
+        20.0 * peak.max(1e-9).log10(),
+        20.0 * rms.max(1e-9).log10()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
