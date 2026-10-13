@@ -472,10 +472,10 @@ impl Lead {
             }
         }
         self.note += (self.target - self.note) * (1.0 / (0.045 * sr));
-        self.vib_amt += (1.0 - self.vib_amt) * (1.0 / (0.9 * sr));
+        self.vib_amt += (1.0 - self.vib_amt) * (1.0 / (1.3 * sr));
         self.vib_ph = (self.vib_ph + 5.3 / sr).fract();
         self.pwm = (self.pwm + 0.17 / sr).fract();
-        let vib = (self.vib_ph * TAU).sin() * 0.2 * self.vib_amt * self.vib_amt;
+        let vib = (self.vib_ph * TAU).sin() * 0.1 * self.vib_amt * self.vib_amt;
         let dt = mtof(self.note + vib) / sr;
         let s = 0.42 * self.saw.saw(dt)
             + 0.3 * self.saw2.saw(dt * 1.004)
@@ -876,7 +876,9 @@ struct BoomVoice {
     t: f32,
     on: bool,
     ph: f32,
+    ph2: f32,
     lp: Svf,
+    bp: Svf,
 }
 
 pub struct Impacts {
@@ -899,7 +901,9 @@ impl Impacts {
             t: 0.0,
             on: false,
             ph: 0.0,
-            lp: Svf::new(1500.0, 0.8, sr),
+            ph2: 0.0,
+            lp: Svf::new(400.0, 0.8, sr),
+            bp: Svf::new(1200.0, 1.0, sr),
         };
         Impacts {
             sr,
@@ -930,7 +934,9 @@ impl Impacts {
             t: 0.0,
             on: true,
             ph: 0.0,
-            lp: Svf::new(2000.0, 0.9, sr),
+            ph2: 0.0,
+            lp: Svf::new(480.0, 0.8, sr),
+            bp: Svf::new(1200.0, 1.0, sr),
         };
     }
     pub fn crash(&mut self, vel: f32) {
@@ -942,11 +948,13 @@ impl Impacts {
         self.r_left = self.r_total;
     }
 
-    /// Returns (left, right, reverb send mono).
+    /// Returns (left, right, reverb send, boom). The boom is returned on its own so the
+    /// engine can add it after the tape saturation (a sub drop through saturation and a
+    /// limiter is what made it distort).
     #[inline]
-    pub fn process(&mut self) -> (f32, f32, f32) {
+    pub fn process(&mut self) -> (f32, f32, f32, f32) {
         let sr = self.sr;
-        let (mut l, mut r, mut send) = (0.0, 0.0, 0.0);
+        let (mut l, mut r, mut send, mut boom) = (0.0, 0.0, 0.0, 0.0);
         let upd = self.tick % 32 == 0;
         self.tick = self.tick.wrapping_add(1);
 
@@ -957,17 +965,23 @@ impl Impacts {
             let n = self.noise[k].next();
             let b = &mut self.booms[k];
             let t = b.t;
-            let f = 30.0 + 75.0 * (-t / 0.22).exp();
+            // a cinematic hit: a body that drops 140 -> 48 Hz (heard even on laptop
+            // speakers), a modest 45 Hz sub, a short transient and a dark rumble
+            let att = (t / 0.003).min(1.0);
+            let f = 48.0 + 92.0 * (-t / 0.09).exp();
             b.ph = (b.ph + f / sr).fract();
-            let sub = (b.ph * TAU).sin() * (-t / 2.0).exp();
+            let body = (b.ph * TAU).sin() * (-t / 0.55).exp() * att;
+            b.ph2 = (b.ph2 + 45.0 / sr).fract();
+            let sub = (b.ph2 * TAU).sin() * (-t / 1.2).exp() * smoothstep(0.0, 0.05, t);
             if upd {
-                b.lp.set(110.0 + 1900.0 * (-t / 0.35).exp(), 0.9, sr);
+                b.lp.set(80.0 + 400.0 * (-t / 0.3).exp(), 0.8, sr);
             }
-            let rumble = b.lp.process(n).0 * (-t / 1.1).exp();
-            let y = tanh_fast(1.4 * (sub * 0.95 + rumble * 0.9));
-            l += y * 0.7;
-            r += y * 0.7;
-            send += y * 0.5;
+            let rumble = b.lp.process(n).0 * (-t / 0.5).exp();
+            let click = b.bp.process(n).1 * (-t / 0.015).exp();
+            let y = body * 0.7 + sub * 0.35 + rumble * 0.6 + click * 0.5;
+            let y = y / (1.0 + 0.4 * y.abs());
+            boom += y * 0.55;
+            send += y * 0.3;
             b.t += 1.0 / sr;
             if b.t > 7.0 {
                 b.on = false;
@@ -1001,6 +1015,6 @@ impl Impacts {
                 self.riser_done = true;
             }
         }
-        (l, r, send)
+        (l, r, send, boom)
     }
 }

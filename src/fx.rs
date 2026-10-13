@@ -294,23 +294,25 @@ impl Tape {
 pub struct Limiter {
     env: f32,
     gain: f32,
-    att: f32,
     rel: f32,
-    gsm: f32,
+    g_att: f32,
+    g_rel: f32,
     dl: [DelayLine; 2],
     la: usize,
     thr: f32,
 }
 
 impl Limiter {
+    /// Look-ahead peak limiter: peaks are seen 4 ms before they leave the delay line and
+    /// the gain is already down when they arrive, so the safety clip never has to act.
     pub fn new(sr: f32, thr_db: f32) -> Self {
-        let la = (sr * 0.0025) as usize;
+        let la = (sr * 0.004) as usize;
         Limiter {
             env: 0.0,
             gain: 1.0,
-            att: coef(0.0012, sr),
             rel: coef(0.25, sr),
-            gsm: coef(0.0015, sr),
+            g_att: coef(0.0008, sr),
+            g_rel: coef(0.06, sr),
             dl: [DelayLine::new(la + 4), DelayLine::new(la + 4)],
             la,
             thr: db(thr_db),
@@ -320,13 +322,13 @@ impl Limiter {
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
         let p = l.abs().max(r.abs());
         if p > self.env {
-            self.env += (p - self.env) * self.att;
-            self.env = self.env.max(p * 0.8);
+            self.env = p; // instant: the look-ahead gives the gain time to follow
         } else {
             self.env += (p - self.env) * self.rel;
         }
         let target = if self.env > self.thr { self.thr / self.env } else { 1.0 };
-        self.gain += (target - self.gain) * self.gsm;
+        let c = if target < self.gain { self.g_att } else { self.g_rel };
+        self.gain += (target - self.gain) * c;
         self.dl[0].write(l);
         self.dl[1].write(r);
         let ol = self.dl[0].tap(self.la) * self.gain;

@@ -19,12 +19,14 @@ const DRONE_GAIN: f32 = 0.42;
 const AIR_GAIN: f32 = 1.0;
 const ARP_GAIN: f32 = 0.52;
 const BASS_GAIN: f32 = 0.42;
-const LEAD_GAIN: f32 = 0.8;
+const LEAD_GAIN: f32 = 0.6;
 const BELL_GAIN: f32 = 0.24;
 const KEYS_GAIN: f32 = 0.2;
 const DRUM_GAIN: f32 = 0.62;
 const MASTER_GAIN: f32 = 1.35;
 const RADIO_GAIN: f32 = 1.0;
+/// lowest note of the arpeggio (keeps it under the lead)
+const ARP_LO: i32 = 52;
 
 /// Where the machine is: free-running, or playing a whole song.
 enum SongState {
@@ -80,6 +82,8 @@ pub struct Engine {
     sec_bars: u32,
     motif: Vec<usize>,
     keys_pat: usize,
+    /// what the lead plays over the current chord (accompaniment stays clear of it)
+    melody_pcs: Vec<i32>,
     // live lead from the phone pads
     play_seen: u32,
     live_timer: f32,
@@ -165,6 +169,9 @@ pub struct Engine {
 
     // effects
     chorus: Chorus,
+    lead_chorus: Chorus,
+    boom_duck: f32,
+    boom_duck_c: f32,
     echo: Echo,
     verb: Reverb,
     gverb: Reverb,
@@ -193,7 +200,7 @@ fn auto_gain(layer: usize, i: f32) -> f32 {
         L_DRUMS => smoothstep(0.36, 0.44, i),
         L_LEAD => smoothstep(0.72, 0.84, i),
         L_KEYS => smoothstep(0.18, 0.32, i) * (1.0 - 0.6 * smoothstep(0.78, 1.0, i)),
-        _ => (0.55 + 0.45 * smoothstep(0.0, 0.2, i)) * (1.0 - 0.75 * smoothstep(0.55, 0.85, i)),
+        _ => 0.45 * (0.55 + 0.45 * smoothstep(0.0, 0.2, i)) * (1.0 - 0.75 * smoothstep(0.55, 0.85, i)),
     }
 }
 
@@ -231,6 +238,7 @@ impl Engine {
             sec_bars: 16,
             motif: vec![0, 1, 2, 3],
             keys_pat: 0,
+            melody_pcs: Vec::new(),
             play_seen: sh.play_seq.load(Relaxed),
             live_timer: 1e9,
             auto_lead_g: 1.0,
@@ -305,6 +313,9 @@ impl Engine {
             drums: Drums::new(sr),
             imp: Impacts::new(sr),
             chorus: Chorus::new(sr),
+            lead_chorus: Chorus::new(sr),
+            boom_duck: 0.0,
+            boom_duck_c: (-1.0 / (0.7 * sr)).exp(),
             echo: Echo::new(sr),
             verb: Reverb::new(sr, 1.9, 28.0, 5200.0),
             gverb: Reverb::new(sr, 0.75, 4.0, 7000.0),
@@ -578,7 +589,7 @@ impl Engine {
                 self.fill_force = Some(*k);
             }
             Ev::Boom => {
-                self.imp.boom();
+                self.boom();
                 self.imp.crash(0.6);
             }
             Ev::Crash(v) => self.imp.crash(*v),
@@ -589,14 +600,14 @@ impl Engine {
 
     /// The last chord: everything hits the tonic together, then the sequencers stop.
     fn final_hit(&mut self) {
-        let notes = self.pad_notes(0, 1.0);
+        let notes = self.pad_notes(0, 1.0, &[]);
         self.pad.release_fast();
         let vel = 0.62 / (notes.len() as f32).sqrt();
         for &n in &notes {
             self.pad.note_on(n, vel, 0.004, 1.8, 1.0);
         }
         let gate = (32.0 * self.sps()) as u32;
-        let (low, upper) = self.keys_voicing(0);
+        let (low, upper) = self.keys_voicing(0, &[]);
         self.keys.note_on(low, 0.9, gate);
         for &n in &upper {
             self.keys.note_on(n, 0.85, gate);
@@ -604,7 +615,7 @@ impl Engine {
         let root = self.bass_root_for(0);
         self.bass.note_on(root, 1.0, gate);
         self.kick(1.0);
-        self.imp.boom();
+        self.boom();
         self.imp.crash(0.8);
         self.chord_idx = 0;
         self.chord_deg = 0;
@@ -769,7 +780,7 @@ impl Engine {
         self.c_arp_env = 1.6 + 2.0 * i;
         self.c_bass_cut = 150.0 * (i * 1.9).exp2() * darkmul.sqrt();
         self.c_bass_env = 1.2 + 2.4 * i;
-        self.c_lead_cut = 1600.0 * (i * 0.9 + 0.3 * sw).exp2() * darkmul;
+        self.c_lead_cut = 1300.0 * (i * 0.9 + 0.3 * sw).exp2() * darkmul;
         self.c_drone_bright = 0.9 + 0.9 * d;
         self.c_air = 0.07 * (0.35 + d) * (1.0 - 0.7 * i);
         self.c_echo_t = 0.75 * 60.0 / self.bpm;
@@ -871,7 +882,7 @@ impl Engine {
     fn on_trigger(&mut self, t: usize) {
         match t {
             T_BOOM => {
-                self.imp.boom();
+                self.boom();
                 self.imp.crash(0.55);
             }
             T_FILL => self.want_fill = true,
@@ -982,7 +993,9 @@ impl Engine {
         self.chord_deg = self.prog[ci % self.prog.len()];
         let i = self.inten;
         let ext = chord_ext(i);
-        let notes = self.pad_notes(self.chord_deg, i);
+        self.melody_pcs = self.melody_pcs_for(ci);
+        let mel = self.melody_pcs.clone();
+        let notes = self.pad_notes(self.chord_deg, i, &mel);
         let low = i > 0.6;
         let upper = if low { &notes[1..] } else { &notes[..] };
         self.pad.release_all();
@@ -994,7 +1007,7 @@ impl Engine {
         if low {
             self.pad.note_on(notes[0], vel * 0.8, attack, 3.0, 0.7);
         }
-        self.arp_notes = arp_tones(self.key, self.mode, self.chord_deg, 4, 57);
+        self.arp_notes = arp_tones(self.key, self.mode, self.chord_deg, 4, ARP_LO);
         self.bass_root = self.bass_root_for(self.chord_deg);
         mask_set(&self.sh.st_chord_mask, &notes);
         self.sh.st_chord_deg.store(self.chord_deg, Relaxed);
@@ -1003,9 +1016,30 @@ impl Engine {
         }
     }
 
+    /// Pitch classes the lead plays over chord `ci` of the loop (empty when the lead is
+    /// silent), so the accompaniment can leave room for them.
+    fn melody_pcs_for(&self, ci: usize) -> Vec<i32> {
+        let active = self.layer_target(L_LEAD).max(self.gains[L_LEAD]) * self.auto_lead_g > 0.1;
+        if !active || self.lead_line.is_empty() {
+            return Vec::new();
+        }
+        let span = self.bpc.max(1) * 16;
+        let (a, b) = (ci as u32 * span, (ci as u32 + 1) * span);
+        let mut v: Vec<i32> = self
+            .lead_line
+            .iter()
+            .filter(|n| n.start >= a && n.start < b)
+            .map(|n| n.midi.rem_euclid(12))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// Pad notes for a chord: close voicing, plus a low root at higher intensity (first).
-    fn pad_notes(&self, d: i32, i: f32) -> Vec<i32> {
-        let mut v = voicing(self.key + 12, self.mode, d, chord_ext(i), 64.0);
+    /// Extensions that would rub against the melody are left out.
+    fn pad_notes(&self, d: i32, i: f32, mel: &[i32]) -> Vec<i32> {
+        let mut v = voicing_clear(self.key + 12, self.mode, d, chord_ext(i), 64.0, mel);
         if i > 0.6 {
             let mut low = deg(self.key, self.mode, d);
             while low > v[0] - 7 {
@@ -1038,13 +1072,14 @@ impl Engine {
         let bpc = self.bpc.max(1);
         let chord_at = |b: u32| self.prog[((b / bpc) as usize) % self.prog.len()];
 
-        let pad = (0..bars).map(|b| self.pad_notes(chord_at(b), i)).collect();
+        let mel_at = |b: u32| self.melody_pcs_for(((b / bpc) as usize) % self.prog.len());
+        let pad = (0..bars).map(|b| self.pad_notes(chord_at(b), i, &mel_at(b))).collect();
 
         let rate = self.arp_rate.max(1);
         let mut arp = Vec::new();
         let mut count = 0usize;
         for b in 0..bars {
-            let tones = arp_tones(self.key, self.mode, chord_at(b), 4, 57);
+            let tones = arp_tones(self.key, self.mode, chord_at(b), 4, ARP_LO);
             let n = tones.len().max(1);
             for _ in 0..(16 / rate) {
                 let idx = self.motif[count % self.motif.len()];
@@ -1086,7 +1121,7 @@ impl Engine {
         let mut keys = Vec::new();
         for b in 0..bars {
             let d = chord_at(b);
-            let (low, upper) = self.keys_voicing(d);
+            let (low, upper) = self.keys_voicing(d, &mel_at(b));
             let tones = self.keys_broken(d, low, &upper);
             for &(st, hit, len, _) in kp {
                 let notes = match hit {
@@ -1329,7 +1364,7 @@ impl Engine {
 
         // ---- bells
         if self.gains[L_BELLS] > 0.01 && sib % 2 == 0 {
-            let p = 0.07 + 0.1 * (1.0 - i);
+            let p = 0.04 + 0.06 * (1.0 - i);
             if self.rng.chance(p) {
                 let j = self.rng.below(4) as i32;
                 let mut n = deg(self.key + 24, self.mode, self.chord_deg + 2 * j);
@@ -1339,7 +1374,7 @@ impl Engine {
                 while n > 93 {
                     n -= 12;
                 }
-                let glassy = self.rng.chance(0.4 + 0.5 * self.dark);
+                let glassy = self.dark > 0.75 && self.rng.chance(0.5);
                 let vel = self.rng.range(0.35, 0.8);
                 let pn = self.rng.range(-0.7, 0.7);
                 self.bells.note_on(n, vel, pn, glassy);
@@ -1353,7 +1388,7 @@ impl Engine {
                 if st as u32 != sib {
                     continue;
                 }
-                let (low, upper) = self.keys_voicing(self.chord_deg);
+                let (low, upper) = self.keys_voicing(self.chord_deg, &self.melody_pcs);
                 let gate = (len * sps) as u32;
                 let mut played = Vec::with_capacity(6);
                 match hit {
@@ -1387,10 +1422,10 @@ impl Engine {
         self.sh.st_lead_prev2.store(self.lead_hist[1], Relaxed);
     }
 
-    /// Keys voicing: a low root under a close upper voicing.
-    fn keys_voicing(&self, d: i32) -> (i32, Vec<i32>) {
+    /// Keys voicing: a low root under a close upper voicing (clear of the melody).
+    fn keys_voicing(&self, d: i32, mel: &[i32]) -> (i32, Vec<i32>) {
         let ext = if self.inten < 0.5 { 5 } else { 4 };
-        let upper = voicing(self.key + 12, self.mode, d, ext, 67.0);
+        let upper = voicing_clear(self.key + 12, self.mode, d, ext, 62.0, mel);
         let mut low = deg(self.key, self.mode, d);
         while low >= upper[0] - 5 {
             low -= 12;
@@ -1505,6 +1540,11 @@ impl Engine {
         }
     }
 
+    fn boom(&mut self) {
+        self.imp.boom();
+        self.boom_duck = 1.0;
+    }
+
     fn kick(&mut self, vel: f32) {
         self.drums.kick(vel, false);
         self.duck_rising = true;
@@ -1566,25 +1606,26 @@ impl Engine {
         let dg = g[L_DRUMS].max(self.fill_gain) * DRUM_GAIN;
         let (kl, kr, gsend) = self.drums.process();
         let (kl, kr, gsend) = (kl * dg, kr * dg, gsend * dg);
-        let (il, ir, isend) = self.imp.process();
+        let (il, ir, isend, boom) = self.imp.process();
+        self.boom_duck *= self.boom_duck_c;
         let (ral, rar, rsend) = self.radio.process();
         let (il, ir, isend) = (il + ral * RADIO_GAIN, ir + rar * RADIO_GAIN, isend + rsend * RADIO_GAIN);
 
         // pad through the ensemble chorus
         let (cl, cr) = self.chorus.process(pad, 1.0);
-        let (ll, lr) = pan(lead, -0.12);
+        let (ll, lr) = self.lead_chorus.process(lead, 0.6);
 
         let dry_l = cl + dr * 0.7 + airl + al + bass * 0.7 + ll + bl + kl + il + epl;
         let dry_r = cr + dr * 0.7 + airr + ar + bass * 0.7 + lr + br + kr + ir + epr;
 
         // tape echo
-        let echo_in = (al + ar) * 0.32 + lead * 0.42 + (bl + br) * 0.3 + (epl + epr) * 0.08;
+        let echo_in = (al + ar) * 0.32 + lead * 0.5 + (bl + br) * 0.3 + (epl + epr) * 0.08;
         let (el, er) = self.echo.process(echo_in, self.c_echo_t, self.c_echo_fb);
 
         // hall
         let rin_l = cl * 0.5
             + al * 0.35
-            + ll * 0.45
+            + ll * 0.65
             + bl * 0.8
             + el * 0.45
             + airl * 0.6
@@ -1594,7 +1635,7 @@ impl Engine {
             + epl * 0.4;
         let rin_r = cr * 0.5
             + ar * 0.35
-            + lr * 0.45
+            + lr * 0.65
             + br * 0.8
             + er * 0.45
             + airr * 0.6
@@ -1622,13 +1663,15 @@ impl Engine {
         let l = (dry_l + el * 0.55 + rl + gl) * MASTER_GAIN;
         let r = (dry_r + er * 0.55 + rr + gr) * MASTER_GAIN;
 
-        let (l, r) = self.tape.process(l, r, self.tape_amt);
+        let bd = 1.0 - 0.35 * self.boom_duck;
+        let (l, r) = self.tape.process(l * bd, r * bd, self.tape_amt);
+        let (l, r) = (l + boom * MASTER_GAIN, r + boom * MASTER_GAIN);
         self.peak = self.peak.max(l.abs().max(r.abs()));
+        // DC blocker before the limiter, so the limiter really is the last word on peaks
+        let (l, r) = (self.dc[0].process(l), self.dc[1].process(r));
         let (l, r) = self.lim.process(l, r);
         let m = self.vol * self.vol * self.fader * self.fader * self.fader * self.song_gain;
-        let l = self.dc[0].process(l * m);
-        let r = self.dc[1].process(r * m);
-        (l, r)
+        (l * m, r * m)
     }
 }
 

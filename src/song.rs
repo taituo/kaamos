@@ -157,11 +157,11 @@ const G_INTRO: [f32; NL] = [1.0, 0.65, 0.0, 0.0, 0.0, 0.0, 0.7, 0.0];
 const G_INTRO_RADIO: [f32; NL] = [0.7, 0.45, 0.0, 0.0, 0.0, 0.0, 0.4, 0.0];
 const G_INTRO_ARP: [f32; NL] = [0.6, 0.6, 1.0, 0.0, 0.0, 0.0, 0.3, 0.0];
 const G_OPEN_BASS: [f32; NL] = [0.7, 0.75, 0.0, 1.0, 1.0, 0.0, 0.3, 0.0];
-const G_OPEN_LEAD: [f32; NL] = [0.7, 0.8, 0.0, 0.0, 0.0, 1.0, 0.3, 0.0];
-const G_VERSE: [f32; NL] = [0.6, 0.85, 0.75, 1.0, 1.0, 1.0, 0.25, 0.45];
+const G_OPEN_LEAD: [f32; NL] = [0.7, 0.8, 0.0, 0.0, 0.0, 0.78, 0.3, 0.0];
+const G_VERSE: [f32; NL] = [0.6, 0.85, 0.75, 1.0, 1.0, 0.75, 0.25, 0.45];
 const G_PRE: [f32; NL] = [0.5, 1.0, 1.0, 1.0, 1.0, 0.0, 0.2, 0.7];
-const G_CHORUS: [f32; NL] = [0.35, 1.0, 1.0, 1.0, 1.0, 1.0, 0.3, 0.5];
-const G_VERSE2: [f32; NL] = [0.5, 0.75, 0.5, 0.85, 1.0, 0.85, 0.3, 0.7];
+const G_CHORUS: [f32; NL] = [0.35, 1.0, 1.0, 1.0, 1.0, 0.92, 0.3, 0.5];
+const G_VERSE2: [f32; NL] = [0.5, 0.75, 0.5, 0.85, 1.0, 0.72, 0.3, 0.7];
 const G_BRIDGE: [f32; NL] = [0.8, 0.75, 0.0, 0.0, 0.0, 0.0, 0.85, 0.85];
 const G_BUILD: [f32; NL] = [0.8, 1.0, 1.0, 0.7, 1.0, 0.0, 0.4, 0.8];
 const G_CLIMAX: [f32; NL] = [0.3, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.45];
@@ -211,7 +211,7 @@ impl Song {
         let verse = Part {
             key,
             mode,
-            lead: gen_lead_styled(&mut rng, key, mode, &vprog, vbpc, &VERSE_STYLE),
+            lead: compose_melody(&mut rng, key, mode, &vprog, vbpc, Role::Verse),
             prog: vprog.clone(),
             bpc: vbpc,
             motif: verse_motif.clone(),
@@ -234,7 +234,7 @@ impl Song {
         let chorus = Part {
             key,
             mode,
-            lead: gen_lead_styled(&mut rng, key, mode, &cprog, 1, &CHORUS_STYLE),
+            lead: compose_melody(&mut rng, key, mode, &cprog, 1, Role::Chorus),
             prog: cprog.clone(),
             bpc: 1,
             motif: if rng.chance(0.5) {
@@ -326,6 +326,8 @@ impl Song {
             _ => Ending::Bookend,
         });
         let climax_shift = *rng.pick(&[2, 2, 1, 0, 0]);
+        // bells are a colour for some songs, not a fixture of every song
+        let bells = rng.chance(0.2);
         let bridge_static = radio.is_some() && rng.chance(0.5);
 
         // radio needs room: the intro lasts at least until the content is over
@@ -558,6 +560,17 @@ impl Song {
             }
         }
 
+        // arrangement passes over the whole song
+        for s in secs.iter_mut() {
+            if !bells || !matches!(s.kind, Kind::Intro | Kind::Bridge | Kind::Outro) {
+                s.gains[L_BELLS] = 0.0;
+            }
+            // a song that opens with the bass keeps the lead for the chorus: it arrives there
+            if opening == Opening::Bass && s.kind == Kind::Verse {
+                s.gains[L_LEAD] = 0.0;
+            }
+        }
+
         Song {
             seed: o.seed,
             bpm,
@@ -598,8 +611,13 @@ impl Song {
             Ending::Stop => "hard-stop ending",
             Ending::Bookend => "back-to-the-intro ending",
         };
+        let bells = if self.secs.iter().any(|s| s.gains[L_BELLS] > 0.0) {
+            " · bells"
+        } else {
+            ""
+        };
         let mut out = format!(
-            "KAAMOS song · seed {} · {} · {:.0} bpm · {} · {ending}\n",
+            "KAAMOS song · seed {} · {} · {:.0} bpm · {} · {ending}{bells}\n",
             self.seed,
             self.key_name(),
             self.bpm,

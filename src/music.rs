@@ -204,6 +204,32 @@ pub fn voicing(root: i32, mode: usize, d: i32, ext: usize, center: f32) -> Vec<i
     v
 }
 
+/// A voicing that leaves room for the melody: the chord's 7th and 9th are dropped when
+/// they would rub a semitone against a note the melody plays over this chord (a minor
+/// second / minor ninth between melody and accompaniment is the harshest interval).
+pub fn voicing_clear(root: i32, mode: usize, d: i32, ext: usize, center: f32, melody_pcs: &[i32]) -> Vec<i32> {
+    let v = voicing(root, mode, d, ext, center);
+    if melody_pcs.is_empty() || ext <= 3 {
+        return v;
+    }
+    let ext_pcs: Vec<i32> = (3..ext as i32)
+        .map(|j| deg(root, mode, d + 2 * j).rem_euclid(12))
+        .collect();
+    let kept: Vec<i32> = v
+        .iter()
+        .copied()
+        .filter(|&n| {
+            let pc = n.rem_euclid(12);
+            !(ext_pcs.contains(&pc) && melody_pcs.iter().any(|&m| matches!((m - pc).rem_euclid(12), 1 | 11)))
+        })
+        .collect();
+    if kept.len() >= 3 {
+        kept
+    } else {
+        v
+    }
+}
+
 /// Arpeggio tones: ascending chord tones starting from a root placed in [lo, lo+11].
 pub fn arp_tones(root: i32, mode: usize, d: i32, ext: usize, lo: i32) -> Vec<i32> {
     let mut r = deg(root, mode, d);
@@ -364,8 +390,11 @@ pub struct LeadNote {
     pub midi: i32,
 }
 
+// ---- the first generator, kept only for the before/after melody report in the tests
+#[cfg(test)]
 type Rhythm = &'static [(u32, u32)];
 
+#[cfg(test)]
 const RHYTHMS: &[Rhythm] = &[
     &[(0, 8), (8, 4), (12, 4), (16, 12), (28, 4)],
     &[(0, 6), (6, 6), (12, 4), (16, 16)],
@@ -376,7 +405,7 @@ const RHYTHMS: &[Rhythm] = &[
     &[(0, 16), (16, 8), (24, 8)],
 ];
 
-/// Verse: lower, sparser, room to breathe (rests between phrases).
+#[cfg(test)]
 const VERSE_RHYTHMS: &[Rhythm] = &[
     &[(0, 4), (4, 4), (8, 8), (24, 8)],
     &[(2, 2), (4, 4), (8, 8), (18, 2), (20, 4), (24, 6)],
@@ -385,7 +414,7 @@ const VERSE_RHYTHMS: &[Rhythm] = &[
     &[(4, 4), (8, 4), (12, 4), (16, 16)],
 ];
 
-/// Chorus: higher, rhythmic, made to be remembered (3+3+2, straight 8ths, long held peaks).
+#[cfg(test)]
 const CHORUS_RHYTHMS: &[Rhythm] = &[
     &[(0, 3), (3, 3), (6, 2), (8, 8), (16, 3), (19, 3), (22, 2), (24, 8)],
     &[(0, 4), (4, 4), (8, 4), (12, 4), (16, 8), (24, 8)],
@@ -394,8 +423,7 @@ const CHORUS_RHYTHMS: &[Rhythm] = &[
     &[(0, 6), (6, 6), (12, 4), (16, 16)],
 ];
 
-/// How a melody is written: its register (scale degrees above the lead root), rhythm
-/// vocabulary, and how strongly later phrases repeat the first one.
+#[cfg(test)]
 pub struct LeadStyle {
     pub lo: i32,
     pub hi: i32,
@@ -409,6 +437,7 @@ pub struct LeadStyle {
     pub same_rhythm: f32,
 }
 
+#[cfg(test)]
 pub const FREE_STYLE: LeadStyle = LeadStyle {
     lo: 3,
     hi: 13,
@@ -418,6 +447,7 @@ pub const FREE_STYLE: LeadStyle = LeadStyle {
     literal: 0.5,
     same_rhythm: 0.0,
 };
+#[cfg(test)]
 pub const VERSE_STYLE: LeadStyle = LeadStyle {
     lo: 0,
     hi: 9,
@@ -427,6 +457,7 @@ pub const VERSE_STYLE: LeadStyle = LeadStyle {
     literal: 0.6,
     same_rhythm: 0.3,
 };
+#[cfg(test)]
 pub const CHORUS_STYLE: LeadStyle = LeadStyle {
     lo: 4,
     hi: 13,
@@ -437,12 +468,12 @@ pub const CHORUS_STYLE: LeadStyle = LeadStyle {
     same_rhythm: 0.6,
 };
 
-/// Generate a lead line over one loop of the progression.
-/// Degrees are relative to `root` (tonic around MIDI 45-56); output in ~MIDI 62-86.
+/// Lead line for free mode.
 pub fn gen_lead(rng: &mut Rng, root: i32, mode: usize, prog: &[i32], bars_per_chord: u32) -> Vec<LeadNote> {
-    gen_lead_styled(rng, root, mode, prog, bars_per_chord, &FREE_STYLE)
+    compose_melody(rng, root, mode, prog, bars_per_chord, Role::Free)
 }
 
+#[cfg(test)]
 pub fn gen_lead_styled(
     rng: &mut Rng,
     root: i32,
@@ -547,6 +578,623 @@ pub fn gen_lead_styled(
         }
     }
     out
+}
+
+// ------------------------------------------------------------------ melody composer
+//
+// Melodies are written the way the theory books describe (sentence and period forms,
+// Narmour's implication-realization, non-chord tones that resolve by step), instead of
+// wandering from chord tone to chord tone:
+//
+//  * a motif (basic idea) with its own rhythm and shape
+//  * sentence: idea, idea repeated (sequenced to the new chord or kept), continuation
+//    that fragments the idea and climbs, cadence on a long stable note
+//  * period: idea + open ending (antecedent), idea again + closed ending (consequent)
+//  * an arch contour: the phrase peaks once, about two thirds of the way through
+//  * small intervals tend to continue, big leaps turn back by step (gap-fill)
+//  * on strong beats: a chord tone, or a tension (9th, 11th, 6th) that resolves by step
+//  * never an avoid note (a semitone above a chord tone) on a strong or long note,
+//    never an augmented second, and its own register above the pad and keys
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Role {
+    Free,
+    Verse,
+    Chorus,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Fit {
+    Chord,
+    /// the chord's 7th: colour, fine on a strong beat, not as a final note
+    Color,
+    /// 9th, 11th, 13th that is not an avoid note
+    Tension,
+    /// a semitone above a chord tone
+    Avoid,
+    Out,
+}
+
+pub fn chord_pcs(key: i32, mode: usize, d: i32) -> [i32; 4] {
+    [0, 2, 4, 6].map(|k| deg(key, mode, d + k).rem_euclid(12))
+}
+
+pub fn fit(n: i32, key: i32, mode: usize, d: i32) -> Fit {
+    if !in_scale(key, mode, n) {
+        return Fit::Out;
+    }
+    let pcs = chord_pcs(key, mode, d);
+    let p = n.rem_euclid(12);
+    if p == pcs[0] || p == pcs[1] || p == pcs[2] {
+        return Fit::Chord;
+    }
+    if pcs[..3].iter().any(|&c| (p - c).rem_euclid(12) == 1) {
+        return Fit::Avoid;
+    }
+    if p == pcs[3] {
+        return Fit::Color;
+    }
+    Fit::Tension
+}
+
+/// Where the lead lives: above the pad (58-70) and the keys.
+pub fn lead_range(role: Role) -> (i32, i32) {
+    match role {
+        Role::Verse => (69, 83),
+        Role::Chorus => (70, 86),
+        Role::Free => (67, 86),
+    }
+}
+
+type Cell = &'static [(u32, u32)];
+
+/// Basic-idea rhythms for a chorus or free lead (16 steps = one bar).
+const HOOK_CELLS: &[Cell] = &[
+    &[(0, 3), (3, 3), (6, 2), (8, 8)],
+    &[(0, 2), (2, 2), (4, 4), (8, 4), (12, 4)],
+    &[(2, 2), (4, 2), (6, 4), (10, 6)],
+    &[(0, 4), (4, 2), (6, 6), (12, 4)],
+    &[(0, 6), (6, 6), (12, 4)],
+    &[(0, 2), (2, 4), (6, 2), (8, 8)],
+];
+
+/// Verse rhythms: room to breathe.
+const VERSE_CELLS: &[Cell] = &[
+    &[(0, 4), (4, 2), (6, 6)],
+    &[(2, 2), (4, 4), (8, 4)],
+    &[(0, 6), (8, 2), (10, 4)],
+    &[(4, 4), (8, 8)],
+    &[(0, 3), (3, 3), (6, 6)],
+];
+
+/// The open ending of a period's first half.
+const OPEN_CELLS: &[Cell] = &[&[(0, 4), (4, 12)], &[(0, 2), (2, 2), (4, 12)], &[(0, 8), (8, 8)]];
+
+/// Cadences: arrive and hold.
+const CADENCE_CELLS: &[Cell] = &[
+    &[(0, 12)],
+    &[(0, 4), (4, 12)],
+    &[(0, 2), (2, 2), (4, 10)],
+    &[(0, 6), (6, 10)],
+];
+const VERSE_CADENCE_CELLS: &[Cell] = &[&[(0, 8)], &[(0, 4), (4, 8)], &[(0, 2), (2, 10)]];
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Job {
+    Idea,
+    Repeat,
+    Frag,
+    Open,
+    Parallel,
+    Cadence,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    start: u32,
+    dur: u32,
+    job: Job,
+    /// index within the copied material (for Repeat / Frag / Parallel)
+    src: usize,
+    /// for Frag: which copy (0, 1)
+    copy: u32,
+}
+
+struct Composer<'a> {
+    key: i32,
+    mode: usize,
+    prog: &'a [i32],
+    bpc: u32,
+    pool: Vec<i32>,
+    role: Role,
+    total: u32,
+    temp: f32,
+    tension: f32,
+}
+
+impl Composer<'_> {
+    fn chord_at(&self, step: u32) -> i32 {
+        self.prog[((step / 16 / self.bpc.max(1)) as usize) % self.prog.len()]
+    }
+
+    fn fit_at(&self, idx: usize, step: u32) -> Fit {
+        fit(self.pool[idx], self.key, self.mode, self.chord_at(step))
+    }
+
+    /// Arch contour: low-middle start, peak around 65%, fall to the cadence.
+    fn target(&self, step: u32) -> f32 {
+        let t = step as f32 / self.total.max(1) as f32;
+        let n = self.pool.len() as f32;
+        let (base, peak) = match self.role {
+            Role::Verse => (0.3, 0.72),
+            _ => (0.3, 0.88),
+        };
+        let a = if t < 0.58 {
+            t / 0.58
+        } else {
+            1.0 - 0.8 * (t - 0.58) / 0.42
+        };
+        n * (base + (peak - base) * a)
+    }
+
+    /// Score-and-sample the next note (index into the pool).
+    #[allow(clippy::too_many_arguments)]
+    fn choose(
+        &self,
+        rng: &mut Rng,
+        prev: Option<usize>,
+        prev_iv: i32,
+        step: u32,
+        dur: u32,
+        must_resolve: bool,
+        stable_end: bool,
+        allow_tension: bool,
+    ) -> usize {
+        let strong = step % 8 == 0 || dur >= 6;
+        let target = self.target(step);
+        let lo = prev.map(|p| p.saturating_sub(6)).unwrap_or(0);
+        let hi = prev
+            .map(|p| (p + 6).min(self.pool.len() - 1))
+            .unwrap_or(self.pool.len() - 1);
+        let mut cands: Vec<(usize, f32)> = Vec::new();
+        for c in lo..=hi {
+            let f = self.fit_at(c, step);
+            if f == Fit::Out {
+                continue;
+            }
+            let n = self.pool[c];
+            if must_resolve {
+                // the tension before must step into a chord tone
+                let Some(p) = prev else { continue };
+                if (c as i32 - p as i32).abs() != 1 || f != Fit::Chord {
+                    continue;
+                }
+            }
+            let mut s = 0.0f32;
+            s += if stable_end {
+                match f {
+                    Fit::Chord => {
+                        let tonic = (n - self.key).rem_euclid(12) == 0;
+                        if tonic {
+                            5.0
+                        } else {
+                            3.0
+                        }
+                    }
+                    _ => -20.0,
+                }
+            } else if strong {
+                match f {
+                    Fit::Chord => 3.0,
+                    Fit::Color => 1.2,
+                    Fit::Tension if allow_tension => 4.6,
+                    Fit::Tension => -1.5,
+                    Fit::Avoid => -12.0,
+                    Fit::Out => -99.0,
+                }
+            } else {
+                match f {
+                    Fit::Chord => 1.0,
+                    Fit::Color => 0.6,
+                    Fit::Tension => 0.5,
+                    Fit::Avoid if dur <= 2 => -1.0,
+                    Fit::Avoid => -6.0,
+                    Fit::Out => -99.0,
+                }
+            };
+            if let Some(p) = prev {
+                let pn = self.pool[p];
+                let iv = n - pn;
+                let a = iv.abs();
+                let chorus = self.role != Role::Verse;
+                s += match a {
+                    0 => -0.8,
+                    1 | 2 => 2.0,
+                    3 | 4 => 1.0,
+                    5 => 0.3,
+                    7 => {
+                        if chorus {
+                            0.0
+                        } else {
+                            -0.8
+                        }
+                    }
+                    6 => -3.0,
+                    8 | 9 => {
+                        if chorus {
+                            -0.4
+                        } else {
+                            -1.2
+                        }
+                    }
+                    12 => {
+                        if chorus {
+                            -0.3
+                        } else {
+                            -2.5
+                        }
+                    }
+                    _ => -6.0,
+                };
+                let pa = prev_iv.abs();
+                if pa >= 7 {
+                    // a leap wants to turn back by step (gap-fill)
+                    if a <= 4 && a > 0 && iv.signum() == -prev_iv.signum() {
+                        s += 2.5;
+                    } else if iv.signum() == prev_iv.signum() {
+                        s -= 3.0;
+                    }
+                } else if (1..=4).contains(&pa) && (1..=4).contains(&a) && iv.signum() == prev_iv.signum() {
+                    s += 0.6; // small intervals continue
+                }
+                if (c as i32 - p as i32).abs() == 1 && a == 3 {
+                    s -= 8.0; // augmented second
+                }
+            }
+            s -= 0.35 * (c as f32 - target).abs();
+            cands.push((c, s));
+        }
+        if cands.is_empty() {
+            // nothing fits the constraints: nearest chord tone to the target
+            return (0..self.pool.len())
+                .filter(|&c| self.fit_at(c, step) == Fit::Chord)
+                .min_by(|&a, &b| (a as f32 - target).abs().total_cmp(&(b as f32 - target).abs()))
+                .unwrap_or(self.pool.len() / 2);
+        }
+        let mx = cands.iter().map(|c| c.1).fold(f32::MIN, f32::max);
+        let w: Vec<f32> = cands.iter().map(|c| ((c.1 - mx) / self.temp).exp()).collect();
+        cands[rng.weighted(&w)].0
+    }
+
+    /// Like `fix`, but keeps the shape of the line: the replacement moves in the same
+    /// direction from the previous note as the original did, and does not flatten a
+    /// moving line into repeated notes.
+    fn fix_dir(&self, idx: usize, step: u32, dur: u32, prev: Option<usize>, want: i32) -> usize {
+        let fixed = self.fix(idx, step, dur);
+        if fixed == idx {
+            if let Some(p) = prev {
+                if idx == p && want != 0 {
+                    // a copy collapsed onto the previous note: nudge it the original way
+                    for d in [want, 2 * want] {
+                        let c = idx as i32 + d;
+                        if c >= 0 && (c as usize) < self.pool.len() {
+                            let f = self.fit_at(c as usize, step);
+                            let strong = step % 8 == 0 || dur >= 6;
+                            if f == Fit::Chord || (!strong && f != Fit::Avoid && f != Fit::Out) {
+                                return c as usize;
+                            }
+                        }
+                    }
+                }
+            }
+            return idx;
+        }
+        let Some(p) = prev else { return fixed };
+        let mut best = fixed;
+        let mut bs = f32::MIN;
+        for d in -3i32..=3 {
+            let c = idx as i32 + d;
+            if c < 0 || c as usize >= self.pool.len() || self.fit_at(c as usize, step) != Fit::Chord {
+                continue;
+            }
+            let c = c as usize;
+            let dir = (c as i32 - p as i32).signum();
+            let mut sc = -(d.abs() as f32);
+            if want != 0 && dir == want {
+                sc += 2.0;
+            }
+            if c == p && want != 0 {
+                sc -= 3.0;
+            }
+            if sc > bs {
+                bs = sc;
+                best = c;
+            }
+        }
+        best
+    }
+
+    /// Make a copied note fit its new chord: strong or long notes that clash move to the
+    /// nearest chord tone (keeping the direction of the original line where possible).
+    fn fix(&self, idx: usize, step: u32, dur: u32) -> usize {
+        let strong = step % 8 == 0 || dur >= 6;
+        let f = self.fit_at(idx, step);
+        let bad = match f {
+            Fit::Out | Fit::Avoid => strong || dur > 2,
+            Fit::Tension => strong,
+            _ => false,
+        };
+        if !bad {
+            return idx;
+        }
+        for d in [1i32, -1, 2, -2, 3, -3] {
+            let c = idx as i32 + d;
+            if c >= 0 && (c as usize) < self.pool.len() && self.fit_at(c as usize, step) == Fit::Chord {
+                return c as usize;
+            }
+        }
+        idx
+    }
+}
+
+/// Compose a lead melody over one loop of the progression.
+pub fn compose_melody(rng: &mut Rng, key: i32, mode: usize, prog: &[i32], bpc: u32, role: Role) -> Vec<LeadNote> {
+    let bars = prog.len() as u32 * bpc.max(1);
+    let unit = (bars * 4).max(16); // four units per loop
+    let scale = unit / 16;
+    let (lo, hi) = lead_range(role);
+    let pool: Vec<i32> = (lo..=hi).filter(|&n| in_scale(key, mode, n)).collect();
+    let c = Composer {
+        key,
+        mode,
+        prog,
+        bpc: bpc.max(1),
+        pool,
+        role,
+        total: unit * 4,
+        temp: if role == Role::Verse { 0.7 } else { 0.55 },
+        tension: match role {
+            Role::Verse => 0.3,
+            Role::Chorus => 0.4,
+            Role::Free => 0.35,
+        },
+    };
+    let period = match role {
+        Role::Chorus => rng.chance(0.5),
+        Role::Free => rng.chance(0.35),
+        Role::Verse => rng.chance(0.25),
+    };
+    let cells = if role == Role::Verse { VERSE_CELLS } else { HOOK_CELLS };
+    let idea: Cell = cells[rng.below(cells.len())];
+    let cad: Cell = if role == Role::Verse {
+        VERSE_CADENCE_CELLS[rng.below(VERSE_CADENCE_CELLS.len())]
+    } else {
+        CADENCE_CELLS[rng.below(CADENCE_CELLS.len())]
+    };
+    let open: Cell = OPEN_CELLS[rng.below(OPEN_CELLS.len())];
+
+    // ---- rhythm plan
+    let mut slots: Vec<Slot> = Vec::new();
+    let push = |slots: &mut Vec<Slot>, base: u32, cell: Cell, job: Job, copy: u32| {
+        for (i, &(st, d)) in cell.iter().enumerate() {
+            slots.push(Slot {
+                start: base + st * scale,
+                dur: d * scale,
+                job,
+                src: i,
+                copy,
+            });
+        }
+    };
+    push(&mut slots, 0, idea, Job::Idea, 0);
+    if period {
+        push(&mut slots, unit, open, Job::Open, 0);
+        push(&mut slots, unit * 2, idea, Job::Parallel, 0);
+    } else {
+        push(&mut slots, unit, idea, Job::Repeat, 0);
+        // fragmentation: the first half of the idea, twice, climbing
+        let half: Vec<(u32, u32)> = idea.iter().copied().filter(|&(st, _)| st < 8).collect();
+        if half.len() >= 2 {
+            for copy in 0..2u32 {
+                for (i, &(st, d)) in half.iter().enumerate() {
+                    let d = d.min(8 - st);
+                    slots.push(Slot {
+                        start: unit * 2 + (copy * 8 + st) * scale,
+                        dur: d * scale,
+                        job: Job::Frag,
+                        src: i,
+                        copy,
+                    });
+                }
+            }
+        } else {
+            for k in 0..4u32 {
+                slots.push(Slot {
+                    start: unit * 2 + k * 4 * scale,
+                    dur: 4 * scale,
+                    job: Job::Frag,
+                    src: 99,
+                    copy: k,
+                });
+            }
+        }
+    }
+    push(&mut slots, unit * 3, cad, Job::Cadence, 0);
+
+    // ---- pitches
+    let mut out: Vec<usize> = Vec::with_capacity(slots.len());
+    let open_n = open.len();
+    let root_step = |step: u32| -> i32 { c.chord_at(step) };
+    let mut must_resolve = false;
+    let mut prev_iv = 0i32;
+    for k in 0..slots.len() {
+        let sl = slots[k];
+        let prev = out.last().copied();
+        let next_close = slots
+            .get(k + 1)
+            .map(|n| n.start <= sl.start + sl.dur + 2)
+            .unwrap_or(false);
+        let last_of_job = slots
+            .get(k + 1)
+            .map(|n| n.job != sl.job || n.start >= unit * 3 && sl.start < unit * 3)
+            .unwrap_or(true);
+        let idx = match sl.job {
+            Job::Idea | Job::Frag if sl.src == 99 => {
+                let allow = rng.chance(c.tension) && next_close;
+                c.choose(rng, prev, prev_iv, sl.start, sl.dur, must_resolve, false, allow)
+            }
+            Job::Idea => {
+                let allow = rng.chance(c.tension) && next_close;
+                c.choose(rng, prev, prev_iv, sl.start, sl.dur, must_resolve, false, allow)
+            }
+            Job::Repeat | Job::Parallel => {
+                let src = out[sl.src];
+                let want = if sl.src > 0 {
+                    (out[sl.src] as i32 - out[sl.src - 1] as i32).signum()
+                } else {
+                    0
+                };
+                let shifted = if sl.job == Job::Repeat && rng.chance(0.6) {
+                    // diatonic sequence: follow the chord's root movement
+                    let mut k = (root_step(sl.start) - root_step(slots[sl.src].start)).rem_euclid(7);
+                    if k > 3 {
+                        k -= 7;
+                    }
+                    (src as i32 + k).clamp(0, c.pool.len() as i32 - 1) as usize
+                } else {
+                    src
+                };
+                c.fix_dir(shifted, sl.start, sl.dur, if sl.src > 0 { prev } else { None }, want)
+            }
+            Job::Frag => {
+                let src = out[sl.src];
+                let up = 1 + sl.copy as i32; // climbing
+                let i = (src as i32 + up).clamp(0, c.pool.len() as i32 - 1) as usize;
+                let want = if sl.src > 0 {
+                    (out[sl.src] as i32 - out[sl.src - 1] as i32).signum()
+                } else {
+                    1
+                };
+                c.fix_dir(i, sl.start, sl.dur, prev, want)
+            }
+            Job::Open => {
+                if last_of_job || sl.src + 1 == open_n {
+                    // an open ending: a chord tone that is not the tonic
+                    let mut best = prev.unwrap_or(c.pool.len() / 2);
+                    let mut bs = f32::MIN;
+                    for i in 0..c.pool.len() {
+                        if c.fit_at(i, sl.start) != Fit::Chord || (c.pool[i] - key).rem_euclid(12) == 0 {
+                            continue;
+                        }
+                        let d = prev.map(|p| (i as f32 - p as f32).abs()).unwrap_or(0.0);
+                        let sc = -d + rng.f() * 0.5;
+                        if sc > bs {
+                            bs = sc;
+                            best = i;
+                        }
+                    }
+                    best
+                } else {
+                    c.choose(rng, prev, prev_iv, sl.start, sl.dur, must_resolve, false, false)
+                }
+            }
+            Job::Cadence => {
+                let is_last = k + 1 == slots.len();
+                if is_last {
+                    c.choose(rng, prev, prev_iv, sl.start, sl.dur, false, true, false)
+                } else {
+                    c.choose(rng, prev, prev_iv, sl.start, sl.dur, must_resolve, false, false)
+                }
+            }
+        };
+        // tension bookkeeping: a strong non-chord tone must resolve by step next
+        let strong = sl.start % 8 == 0 || sl.dur >= 6;
+        must_resolve = strong && matches!(c.fit_at(idx, sl.start), Fit::Tension) && next_close;
+        if let Some(p) = prev {
+            prev_iv = c.pool[idx] - c.pool[p];
+        }
+        out.push(idx);
+    }
+
+    // the cadence's last note is approached by step when there is a note before it
+    let n = out.len();
+    if n >= 2 && slots[n - 2].job == Job::Cadence {
+        let fin = out[n - 1];
+        let from_above = rng.chance(0.65);
+        let cand = if from_above { fin + 1 } else { fin.saturating_sub(1) };
+        if cand < c.pool.len() {
+            let a = (c.pool[cand] - c.pool[fin]).abs();
+            let f = c.fit_at(cand, slots[n - 2].start);
+            if a != 3 && f != Fit::Avoid && f != Fit::Out {
+                out[n - 2] = cand;
+            }
+        }
+    }
+
+    // ---- repair: whatever the copies produced, no avoid notes on strong or long notes
+    // and no augmented seconds
+    for _ in 0..3 {
+        for k in 0..out.len() {
+            let sl = slots[k];
+            // a strong tension is fine when the next note resolves it by step (appoggiatura)
+            let resolved = c.fit_at(out[k], sl.start) == Fit::Tension
+                && slots.get(k + 1).is_some_and(|nx| {
+                    nx.start <= sl.start + sl.dur + 2
+                        && (out[k + 1] as i32 - out[k] as i32).abs() == 1
+                        && c.fit_at(out[k + 1], nx.start) == Fit::Chord
+                });
+            if !resolved {
+                let prev = if k > 0 { Some(out[k - 1]) } else { None };
+                let want = prev.map(|p| (out[k] as i32 - p as i32).signum()).unwrap_or(0);
+                out[k] = c.fix_dir(out[k], sl.start, sl.dur, prev, want);
+            }
+            if k > 0 {
+                let (p, q) = (out[k - 1], out[k]);
+                let a = (c.pool[q] - c.pool[p]).abs();
+                if a == 3 && (q as i32 - p as i32).abs() == 1 {
+                    // step past it: continue one more scale step, or turn back
+                    let dir = q as i32 - p as i32;
+                    let ahead = q as i32 + dir;
+                    let alt = if ahead >= 0 && (ahead as usize) < c.pool.len() {
+                        ahead as usize
+                    } else {
+                        p
+                    };
+                    let alt2 = (p as i32 - dir).clamp(0, c.pool.len() as i32 - 1) as usize;
+                    let ok = |i: usize| !matches!(c.fit_at(i, sl.start), Fit::Avoid | Fit::Out);
+                    out[k] = if ok(alt) { alt } else { alt2 };
+                }
+            }
+        }
+    }
+
+    // ---- notes, with anticipations (the arrival pushed onto the "and" before the bar)
+    let mut notes: Vec<LeadNote> = slots
+        .iter()
+        .zip(out.iter())
+        .map(|(s, &i)| LeadNote {
+            start: s.start,
+            dur: s.dur,
+            midi: c.pool[i],
+        })
+        .collect();
+    if role != Role::Verse {
+        for k in 1..notes.len() {
+            let st = notes[k].start;
+            if st % 16 == 0 && rng.chance(0.3) {
+                let ns = st - 2;
+                let p = notes[k - 1];
+                // it must not clash with the chord it arrives early over
+                let early = fit(notes[k].midi, key, mode, c.chord_at(ns));
+                if p.start + 1 < ns && p.start + p.dur <= st && !matches!(early, Fit::Avoid | Fit::Out) {
+                    notes[k - 1].dur = p.dur.min(ns - p.start);
+                    notes[k].start = ns;
+                    notes[k].dur += 2;
+                }
+            }
+        }
+    }
+    notes
 }
 
 /// A progression from the template list that passes `keep` (only major/minor triads).
@@ -788,6 +1436,234 @@ mod tests {
         assert!(q[i79] > r[i79]);
         // out-of-scale notes never get suggested
         assert_eq!(suggest_next(key, mode, 0, None, None, None, &[70])[0], 0.0);
+    }
+
+    /// Melody quality report (run with --nocapture to see it).
+    fn report(name: &str, gen: &dyn Fn(&mut Rng, i32, usize, &[i32], u32) -> Vec<LeadNote>) -> [f32; 8] {
+        let mut acc = [0.0f32; 8];
+        let mut nmel = 0.0;
+        for s in 0..300u64 {
+            let mut rng = Rng::new(s * 7 + 1);
+            let key = key_root(rng.below(12) as i32);
+            let dark = rng.f();
+            let mode = pick_mode(&mut rng, dark);
+            let prog = pick_prog(&mut rng, mode, 0.7);
+            let bpc = if prog.len() == 2 { 2 } else { 1 + rng.below(2) as u32 };
+            let notes = gen(&mut rng, key, mode, &prog, bpc);
+            let chord_at = |st: u32| prog[((st / 16 / bpc) as usize) % prog.len()];
+            let (mut strong, mut on_chord, mut tens_res, mut bad, mut aug2, mut leaps, mut recov, mut low) =
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            for (i, n) in notes.iter().enumerate() {
+                let st = n.start % 16 == 0 || n.start % 16 == 8 || n.dur >= 6;
+                let f = fit(n.midi, key, mode, chord_at(n.start));
+                if n.midi <= 70 {
+                    low += 1.0;
+                }
+                if st {
+                    strong += 1.0;
+                    match f {
+                        Fit::Chord | Fit::Color => on_chord += 1.0,
+                        Fit::Tension => {
+                            if let Some(nx) = notes.get(i + 1) {
+                                let a = (nx.midi - n.midi).abs();
+                                if (1..=2).contains(&a) && fit(nx.midi, key, mode, chord_at(nx.start)) == Fit::Chord {
+                                    tens_res += 1.0;
+                                }
+                            }
+                        }
+                        Fit::Avoid | Fit::Out => bad += 1.0,
+                    }
+                }
+                if let Some(nx) = notes.get(i + 1) {
+                    let iv = nx.midi - n.midi;
+                    if iv.abs() == 3 {
+                        let (a, b) = (n.midi.min(nx.midi), n.midi.max(nx.midi));
+                        if (a + 1..b).all(|m| !in_scale(key, mode, m)) {
+                            aug2 += 1.0;
+                        }
+                    }
+                    if iv.abs() >= 7 {
+                        leaps += 1.0;
+                        if let Some(n2) = notes.get(i + 2) {
+                            let iv2 = n2.midi - nx.midi;
+                            if iv2.abs() <= 4 && iv2.signum() == -iv.signum() {
+                                recov += 1.0;
+                            }
+                        }
+                    }
+                }
+            }
+            let nn = notes.len().max(1) as f32;
+            let strong_n: f32 = if strong > 0.0 { strong } else { 1.0 };
+            let peak = notes
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, n)| n.midi)
+                .map(|(i, _)| i as f32 / nn)
+                .unwrap_or(0.0);
+            let row = [
+                on_chord / strong_n,
+                tens_res / strong_n,
+                bad / strong_n,
+                aug2,
+                if leaps > 0.0 { recov / leaps } else { 1.0 },
+                low / nn,
+                peak,
+                nn,
+            ];
+            for k in 0..8 {
+                acc[k] += row[k];
+            }
+            nmel += 1.0;
+        }
+        for k in 0..8 {
+            acc[k] /= nmel;
+        }
+        println!(
+            "{name:<14} strong on chord {:>4.0}%  strong tension resolved {:>4.0}%  strong avoid/out {:>4.1}%  aug2/melody {:.2}  leaps recovered {:>4.0}%  notes in pad register {:>4.0}%  peak at {:>3.0}%  notes {:.1}",
+            acc[0] * 100.0, acc[1] * 100.0, acc[2] * 100.0, acc[3], acc[4] * 100.0, acc[5] * 100.0, acc[6] * 100.0, acc[7]
+        );
+        acc
+    }
+
+    #[test]
+    fn melody_examples() {
+        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        for (seed, role) in [
+            (3u64, Role::Chorus),
+            (8, Role::Chorus),
+            (21, Role::Chorus),
+            (5, Role::Verse),
+            (13, Role::Verse),
+        ] {
+            let mut rng = Rng::new(seed);
+            let key = key_root(9);
+            let mode = 4;
+            let prog = vec![5, 2, 6, 0];
+            let m = compose_melody(
+                &mut rng,
+                key,
+                mode,
+                &prog,
+                if role == Role::Verse { 2 } else { 1 },
+                role,
+            );
+            let line: Vec<String> = m
+                .iter()
+                .map(|n| {
+                    let f = fit(
+                        n.midi,
+                        key,
+                        mode,
+                        prog[((n.start / 16 / if role == Role::Verse { 2 } else { 1 }) as usize) % 4],
+                    );
+                    let tag = match f {
+                        Fit::Tension => "*",
+                        Fit::Color => "7",
+                        _ => "",
+                    };
+                    format!(
+                        "{}{}{}@{}:{}",
+                        names[n.midi.rem_euclid(12) as usize],
+                        n.midi / 12 - 1,
+                        tag,
+                        n.start,
+                        n.dur
+                    )
+                })
+                .collect();
+            println!("{:?} seed {seed} over F C G Am: {}", role, line.join(" "));
+        }
+    }
+
+    /// How much of the lead's time it rubs a semitone against a pad note (old pad and
+    /// lead registers vs new): the "next to the note" sound.
+    fn clash_report(
+        name: &str,
+        lead_shift: i32,
+        clear: bool,
+        gen: &dyn Fn(&mut Rng, i32, usize, &[i32], u32) -> Vec<LeadNote>,
+    ) -> f32 {
+        let (mut clash_t, mut total_t) = (0.0f32, 0.0f32);
+        for s in 0..300u64 {
+            let mut rng = Rng::new(s * 13 + 5);
+            let key = key_root(rng.below(12) as i32);
+            let dark = rng.f();
+            let mode = pick_mode(&mut rng, dark);
+            let prog = pick_prog(&mut rng, mode, 0.5);
+            let bpc = if prog.len() == 2 { 2 } else { 1 + rng.below(2) as u32 };
+            let notes = gen(&mut rng, key, mode, &prog, bpc);
+            for n in &notes {
+                let ci = ((n.start / 16 / bpc) as usize) % prog.len();
+                let d = prog[ci];
+                let span = (ci as u32 * bpc * 16, (ci as u32 + 1) * bpc * 16);
+                let pcs: Vec<i32> = if clear {
+                    notes
+                        .iter()
+                        .filter(|x| x.start >= span.0 && x.start < span.1)
+                        .map(|x| x.midi.rem_euclid(12))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pad = voicing_clear(key + 12, mode, d, 5, 64.0, &pcs); // pad at verse intensity: 9th chords
+                let m = n.midi + lead_shift;
+                let rub = pad.iter().any(|&p| matches!(m - p, 1 | -1 | 11 | 13 | -11 | -13));
+                total_t += n.dur as f32;
+                if rub {
+                    clash_t += n.dur as f32;
+                }
+            }
+        }
+        let r = clash_t / total_t;
+        println!(
+            "{name:<14} lead time rubbing a semitone (or 9th) against the pad: {:>4.1}%",
+            r * 100.0
+        );
+        r
+    }
+
+    #[test]
+    fn clash_with_pad() {
+        clash_report("old verse", 0, false, &|r, k, m, p, b| {
+            gen_lead_styled(r, k, m, p, b, &VERSE_STYLE)
+        });
+        clash_report("old chorus", 0, false, &|r, k, m, p, b| {
+            gen_lead_styled(r, k, m, p, b, &CHORUS_STYLE)
+        });
+        clash_report("new verse", 0, false, &|r, k, m, p, b| {
+            compose_melody(r, k, m, p, b, Role::Verse)
+        });
+        clash_report("new chorus", 0, false, &|r, k, m, p, b| {
+            compose_melody(r, k, m, p, b, Role::Chorus)
+        });
+        let v = clash_report("new + clear v", 0, true, &|r, k, m, p, b| {
+            compose_melody(r, k, m, p, b, Role::Verse)
+        });
+        let c = clash_report("new + clear c", 0, true, &|r, k, m, p, b| {
+            compose_melody(r, k, m, p, b, Role::Chorus)
+        });
+        assert!(v < 0.2 && c < 0.2, "{v} {c}");
+    }
+
+    #[test]
+    fn melody_report() {
+        let old_v = report("old verse", &|r, k, m, p, b| {
+            gen_lead_styled(r, k, m, p, b, &VERSE_STYLE)
+        });
+        let old_c = report("old chorus", &|r, k, m, p, b| {
+            gen_lead_styled(r, k, m, p, b, &CHORUS_STYLE)
+        });
+        let new_v = report("new verse", &|r, k, m, p, b| compose_melody(r, k, m, p, b, Role::Verse));
+        let new_c = report("new chorus", &|r, k, m, p, b| {
+            compose_melody(r, k, m, p, b, Role::Chorus)
+        });
+        let _ = (old_v, old_c);
+        for r in [new_v, new_c] {
+            assert!(r[2] < 0.01, "avoid notes on strong beats: {}", r[2]);
+            assert!(r[3] < 0.01, "augmented seconds: {}", r[3]);
+            assert!(r[5] < 0.15, "too much in the pad register: {}", r[5]);
+        }
     }
 
     #[test]

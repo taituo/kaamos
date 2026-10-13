@@ -111,13 +111,44 @@ KAAMOS song · seed 8 · E dorian · 96 bpm · 3:30 · back-to-the-intro ending
   it comes back.
 - **B-section**: a breakdown on new chords with keys and bells, then a four-bar build.
 - **Climax**: the chorus again with BOOM, four-on-the-floor drums and often a key change
-  up a step or a half step.
+  up a step or a half step. A song that opens with the bass saves the lead for the
+  chorus, so it arrives there. Bells are a colour for about one song in five.
 - **Ending**: a fade-out, a hard stop on the home chord, or a return to the intro mood.
 
 The seed picks the key, mode, tempo, form, opening and ending. `--minutes 2.5`,
 `--bpm`, `--darkness`, `--ending fade|stop|bookend` and `--radio on|off` steer it.
 Measured in LUFS, the sections follow the shape you'd expect: verse below chorus,
 the B-section drops about 3-4 dB, the climax is the loudest part.
+
+### How the melodies are written
+
+The lead is composed, not just picked from the chord. Each melody follows rules from
+melody and harmony textbooks:
+
+- **Form**: a *sentence* (idea, the idea again (sequenced to the new chord or kept),
+  a continuation that breaks the idea into pieces and climbs, a cadence) or a *period*
+  (idea + open ending, idea again + closed ending)
+  ([Fundamentals, Function, and Form](https://milnepublishing.geneseo.edu/fundamentals-function-form/chapter/35-sentences-and-periods/)).
+- **Contour**: one high point per phrase, about two thirds of the way through.
+- **Intervals** (Narmour's implication-realization): small steps tend to continue,
+  a leap of a fifth or more turns back by step
+  ([Music Theory Online](https://www.mtosmt.org/issues/mto.95.1.6/mto.95.1.6.royal.php)).
+- **Tension**: on a strong beat the melody may lean on a 9th, 11th or 6th, but it
+  then steps into a chord tone (an appoggiatura)
+  ([non-chord tones](https://iastate.pressbooks.pub/comprehensivemusicianship/chapter/10-6-part-writing-non-chord-tones-theory-exercises/)).
+- **Never**: an avoid note (a semitone above a chord tone) on a strong or long note,
+  or an augmented second ([avoid note](https://en.wikipedia.org/wiki/Avoid_note)).
+- **Register**: the lead has its own range above the pad and keys, and the pad and
+  keys leave out a 7th or 9th that would rub a semitone against the melody.
+
+Measured over 300 random keys, modes and progressions (`cargo test melody -- --nocapture`):
+
+| | strong beats on a chord tone | resolved tensions | avoid notes on strong beats | augmented 2nds | leaps that turn back | lead rubbing the pad |
+|---|---|---|---|---|---|---|
+| first version, verse | 98% | 1% | 0.6% | 0.06 per melody | 70% | 38% |
+| first version, chorus | 93% | 2% | 2.1% | 0.16 per melody | 62% | 33% |
+| now, verse | 90% | 10% | 0% | 0 | 90% | 5.5% |
+| now, chorus | 88% | 11% | 0% | 0 | 80% | 5.4% |
 
 ### Radio voices
 
